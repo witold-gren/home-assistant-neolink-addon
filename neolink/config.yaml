@@ -1,0 +1,48 @@
+name: Neolink (Reolink battery & 4G cameras)
+version: "0.1.0"
+slug: neolink
+description: Bridge for Reolink cameras without a local API (battery, 4G LTE) with a WebSocket API for the Neolink integration.
+url: https://github.com/witold-gren/home-assistant-neolink-addon
+arch:
+  - amd64
+  - aarch64
+init: false
+startup: services
+boot: auto
+hassio_api: true
+discovery:
+  - neolink
+ports:
+  8554/tcp: 8564
+  3002/tcp: null
+ports_description:
+  8554/tcp: RTSP (camera video, with the password announced to the integration)
+  3002/tcp: WebSocket API (by default only inside the HA network)
+options:
+  log_level: info
+  battery_minutes: 30
+  motion: false
+  push: true
+  motion_seconds: 30
+  cameras:
+    - name: G330
+      uid: ""
+      username: admin
+      password: ""
+      discovery: cellular
+      stream: subStream
+      idle_disconnect: true
+schema:
+  log_level: list(error|warn|info|debug)
+  battery_minutes: int(0,1440)
+  motion: bool
+  push: bool
+  motion_seconds: int(5,600)
+  cameras:
+    - name: match(^[A-Za-z0-9_]+$)
+      uid: str
+      username: str
+      password: password
+      discovery: list(cellular|relay|map|remote|local)
+      stream: list(subStream|mainStream|both)
+      idle_disconnect: bool

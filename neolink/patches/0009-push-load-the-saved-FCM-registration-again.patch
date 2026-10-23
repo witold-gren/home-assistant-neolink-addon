@@ -1,0 +1,76 @@
+From 54eaa53b2124b651b50dce0e0b4c5528f0e9eed9 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Witold=20Gre=C5=84?= <witold.gren@gmail.com>
+Date: Mon, 19 Oct 2026 17:22:16 +0200
+Subject: [PATCH] push: load the saved FCM registration again
+
+fcm-push-listener deserialised the base64 keys as &str, which the TOML
+deserializer can't lend, so neolink_token.toml never loaded and every
+start registered a new token - Firebase often answered that with
+PHONE_REGISTRATION_ERROR for a minute or more. Deserialise as String;
+TOML round-trip test.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vendor/fcm-push-listener/Cargo.toml      |  3 +++
+ vendor/fcm-push-listener/src/fcm.rs      |  7 +++++--
+ vendor/fcm-push-listener/src/register.rs | 17 +++++++++++++++++
+ 3 files changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/vendor/fcm-push-listener/Cargo.toml b/vendor/fcm-push-listener/Cargo.toml
+index 1482a09..23cea55 100644
+--- a/vendor/fcm-push-listener/Cargo.toml
++++ b/vendor/fcm-push-listener/Cargo.toml
+@@ -108,3 +108,6 @@ version = "1"
+ 
+ [build-dependencies.prost-build]
+ version = "0.14"
++
++[dev-dependencies.toml]
++version = "0.8.2"
+diff --git a/vendor/fcm-push-listener/src/fcm.rs b/vendor/fcm-push-listener/src/fcm.rs
+index 9641944..2d8d93d 100644
+--- a/vendor/fcm-push-listener/src/fcm.rs
++++ b/vendor/fcm-push-listener/src/fcm.rs
+@@ -14,9 +14,12 @@ fn from_base64<'de, D: serde::de::Deserializer<'de>>(
+ ) -> std::result::Result<Vec<u8>, D::Error> {
+     use base64::Engine;
+ 
+-    <&str>::deserialize(deserializer).and_then(|s| {
++    // String, not &str: the TOML deserializer can't lend borrowed strings, so the
++    // saved registration never loaded and every start registered a new token
++    // (which Firebase often rejected with PHONE_REGISTRATION_ERROR).
++    String::deserialize(deserializer).and_then(|s| {
+         base64::engine::general_purpose::URL_SAFE_NO_PAD
+-            .decode(s)
++            .decode(&s)
+             .map_err(serde::de::Error::custom)
+     })
+ }
+diff --git a/vendor/fcm-push-listener/src/register.rs b/vendor/fcm-push-listener/src/register.rs
+index aaec894..c86d899 100644
+--- a/vendor/fcm-push-listener/src/register.rs
++++ b/vendor/fcm-push-listener/src/register.rs
+@@ -54,3 +54,20 @@ pub async fn register(
+         keys: fcm_register_result.keys,
+     })
+ }
++
++#[cfg(test)]
++mod toml_roundtrip_tests {
++    use super::*;
++
++    #[test]
++    fn registration_survives_toml_roundtrip() {
++        let reg = Registration {
++            fcm_token: "tok".into(),
++            gcm: gcm::Session { android_id: 5_000_000_000_000_000_000, security_token: 17_000_000_000_000_000_000 },
++            keys: fcm::WebPushKeys { public_key: vec![1, 2, 3], private_key: vec![4, 5], auth_secret: vec![6] },
++        };
++        let s = toml::to_string(&reg).unwrap();
++        let back: Registration = toml::from_str(&s).unwrap();
++        assert_eq!(back.keys.public_key, vec![1, 2, 3]);
++    }
++}
+-- 
+2.54.0 (Apple Git-157)
+

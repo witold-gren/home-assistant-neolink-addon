@@ -1,0 +1,120 @@
+From 9656edd1bb2b2d8637c9a3123116905033a5f2c8 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Witold=20Gre=C5=84?= <witold.gren@gmail.com>
+Date: Mon, 19 Oct 2026 19:06:44 +0200
+Subject: [PATCH] ws: report detection type (person/vehicle/animal/motion) from
+ push ALMTYPE
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/ws/mod.rs | 71 ++++++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 68 insertions(+), 3 deletions(-)
+
+diff --git a/src/ws/mod.rs b/src/ws/mod.rs
+index 4609db6..0798964 100644
+--- a/src/ws/mod.rs
++++ b/src/ws/mod.rs
+@@ -106,6 +106,8 @@ struct CameraState {
+     motion_enabled: bool,
+     /// Unix time (s) of the last motion push notification
+     last_motion: Option<u64>,
++    /// What the last push reported: person, vehicle, animal or motion (Reolink ALMTYPE)
++    last_detection: Option<String>,
+     /// Unix time (s) of the cached snapshot
+     snapshot_at: Option<u64>,
+     /// Unix time (s) of the snapshot taken after the last motion notification
+@@ -334,10 +336,14 @@ async fn watch_camera(app: App, name: &str, ws: &WebsocketConfig) -> AnyResult<(
+             pn.borrow_and_update();
+             loop {
+                 pn.changed().await?;
+-                log_push(&name, &pn.borrow_and_update());
++                let kind = detection_kind(&pn.borrow_and_update());
++                log_push(&name, &pn.borrow());
+                 update(&app, &name, |s| {
+                     s.motion = Some(true);
+                     s.last_motion = Some(now());
++                    if kind.is_some() {
++                        s.last_detection = kind;
++                    }
+                 })
+                 .await;
+                 // The notification wakes the camera for 30 s: keep a still of this event
+@@ -356,8 +362,15 @@ async fn watch_camera(app: App, name: &str, ws: &WebsocketConfig) -> AnyResult<(
+                         _ = sleep(hold) => break,
+                         v = pn.changed() => {
+                             v?;
+-                            log_push(&name, &pn.borrow_and_update());
+-                            update(&app, &name, |s| s.last_motion = Some(now())).await;
++                            let kind = detection_kind(&pn.borrow_and_update());
++                            log_push(&name, &pn.borrow());
++                            update(&app, &name, |s| {
++                                s.last_motion = Some(now());
++                                if kind.is_some() {
++                                    s.last_detection = kind;
++                                }
++                            })
++                            .await;
+                         }
+                     }
+                 }
+@@ -416,6 +429,58 @@ async fn watch_camera(app: App, name: &str, ws: &WebsocketConfig) -> AnyResult<(
+     Ok(())
+ }
+ 
++/// Detection type from a Reolink push: `data.ALMTYPE` ("AI_PEOPLE", "AI_VEHICLE",
++/// "AI_DOG_CAT", "MD", ...; possibly several, comma-separated) -> person / vehicle /
++/// animal / motion. Unknown types are passed on in lower case.
++#[cfg(feature = "pushnoti")]
++fn detection_kind(noti: &Option<crate::common::PushNoti>) -> Option<String> {
++    let message: serde_json::Value = serde_json::from_str(&noti.as_ref()?.message).ok()?;
++    alarm_kind(message["data"]["ALMTYPE"].as_str()?)
++}
++
++fn alarm_kind(almtype: &str) -> Option<String> {
++    let kinds: Vec<String> = almtype
++        .split(',')
++        .map(|t| t.trim().to_ascii_uppercase())
++        .filter(|t| !t.is_empty())
++        .collect();
++    // Most specific first, when the camera reports several at once
++    for (needle, kind) in [
++        ("PEOPLE", "person"),
++        ("PERSON", "person"),
++        ("FACE", "person"),
++        ("VEHICLE", "vehicle"),
++        ("DOG", "animal"),
++        ("CAT", "animal"),
++        ("ANIMAL", "animal"),
++    ] {
++        if kinds.iter().any(|t| t.contains(needle)) {
++            return Some(kind.to_string());
++        }
++    }
++    if kinds.iter().any(|t| t == "MD" || t == "PIR" || t.contains("MOTION")) {
++        return Some("motion".to_string());
++    }
++    kinds.first().map(|t| t.to_ascii_lowercase())
++}
++
++#[cfg(test)]
++mod alarm_kind_tests {
++    use super::alarm_kind;
++
++    #[test]
++    fn maps_reolink_alarm_types() {
++        assert_eq!(alarm_kind("AI_PEOPLE").as_deref(), Some("person"));
++        assert_eq!(alarm_kind("AI_VEHICLE").as_deref(), Some("vehicle"));
++        assert_eq!(alarm_kind("AI_DOG_CAT").as_deref(), Some("animal"));
++        assert_eq!(alarm_kind("MD").as_deref(), Some("motion"));
++        assert_eq!(alarm_kind("PIR").as_deref(), Some("motion"));
++        assert_eq!(alarm_kind("MD,AI_VEHICLE").as_deref(), Some("vehicle"));
++        assert_eq!(alarm_kind("VISITOR").as_deref(), Some("visitor"));
++        assert_eq!(alarm_kind(""), None);
++    }
++}
++
+ #[cfg(feature = "pushnoti")]
+ fn log_push(name: &str, noti: &Option<crate::common::PushNoti>) {
+     log::info!("{name}: push notification (motion)");
+-- 
+2.54.0 (Apple Git-157)
+

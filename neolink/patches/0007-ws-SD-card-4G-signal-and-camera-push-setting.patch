@@ -1,0 +1,333 @@
+From 5458194c627a8de46ce94f2b3b7058e4e3ce8a96 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Witold=20Gre=C5=84?= <witold.gren@gmail.com>
+Date: Sat, 17 Oct 2026 19:05:39 +0200
+Subject: [PATCH 7/7] ws: SD card, 4G signal and camera push setting
+
+Core: HddInfoList (102), PushTask (219/218), Net3g4gInfo (255, sent by
+4G cameras unrequested every few seconds while connected) and
+next_net_3g4g_info(); the payload debug print names the message id.
+
+ws state: storage (total/free GB, formatted, mounted), push_enabled,
+signal_level/signal_value/mobile_operator (followed passively while
+connected); command push {on}.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/core/src/bc/de.rs                |  3 +-
+ crates/core/src/bc/model.rs             |  8 ++
+ crates/core/src/bc/xml.rs               | 62 ++++++++++++++++
+ crates/core/src/bc_protocol/settings.rs | 46 ++++++++++++
+ src/ws/mod.rs                           | 97 ++++++++++++++++++++++++-
+ 5 files changed, 211 insertions(+), 5 deletions(-)
+
+diff --git a/crates/core/src/bc/de.rs b/crates/core/src/bc/de.rs
+index 182bcc7..2aa9b77 100644
+--- a/crates/core/src/bc/de.rs
++++ b/crates/core/src/bc/de.rs
+@@ -193,7 +193,8 @@ fn bc_modern_msg<'a>(
+         } else {
+             if context.debug {
+                 println!(
+-                    "Payload Txt: {:?}",
++                    "Payload Txt (msg {}): {:?}",
++                    header.msg_id,
+                     String::from_utf8(processed_payload_buf.to_vec())
+                         .unwrap_or("Not Text".to_string())
+                 );
+diff --git a/crates/core/src/bc/model.rs b/crates/core/src/bc/model.rs
+index 6a6a80a..94d21af 100644
+--- a/crates/core/src/bc/model.rs
++++ b/crates/core/src/bc/model.rs
+@@ -60,6 +60,14 @@ pub const MSG_ID_SET_RECORD: u32 = 82;
+ pub const MSG_ID_SET_AUDIO_TASK: u32 = 231;
+ /// Get the alarm sound on detection (AudioTask)
+ pub const MSG_ID_GET_AUDIO_TASK: u32 = 232;
++/// Get storage (SD card) state (HddInfoList)
++pub const MSG_ID_GET_HDD_INFO: u32 = 102;
++/// Set push notifications on/off (PushTask)
++pub const MSG_ID_SET_PUSH_TASK: u32 = 218;
++/// Get push notifications on/off (PushTask)
++pub const MSG_ID_GET_PUSH_TASK: u32 = 219;
++/// Mobile network state, sent by 4G cameras unrequested (Net3g4gInfo)
++pub const MSG_ID_NET_3G4G_INFO: u32 = 255;
+ /// General system info messages have this ID
+ pub const MSG_ID_GET_GENERAL: u32 = 104;
+ /// Setting general system info (clock mostly) messages have this ID
+diff --git a/crates/core/src/bc/xml.rs b/crates/core/src/bc/xml.rs
+index e194767..ae3ab0a 100644
+--- a/crates/core/src/bc/xml.rs
++++ b/crates/core/src/bc/xml.rs
+@@ -150,6 +150,15 @@ pub struct BcXml {
+     /// Alarm sound (siren) on detection on/off with its schedule
+     #[serde(rename = "AudioTask", skip_serializing_if = "Option::is_none")]
+     pub audio_task: Option<ScheduleTask>,
++    /// Push notifications from the camera on/off with its schedule
++    #[serde(rename = "PushTask", skip_serializing_if = "Option::is_none")]
++    pub push_task: Option<ScheduleTask>,
++    /// Storage (SD card) state
++    #[serde(rename = "HddInfoList", skip_serializing_if = "Option::is_none")]
++    pub hdd_info_list: Option<HddInfoList>,
++    /// Mobile network state, sent by 4G cameras unrequested (msg 255)
++    #[serde(rename = "Net3g4gInfo", skip_serializing_if = "Option::is_none")]
++    pub net_3g4g_info: Option<Net3g4gInfo>,
+ }
+ 
+ impl BcXml {
+@@ -2055,3 +2064,56 @@ pub struct TypeSchedule {
+     #[serde(rename = "valueTable")]
+     pub value_table: String,
+ }
++
++/// HddInfoList xml (get 102)
++#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
++pub struct HddInfoList {
++    /// XML Version
++    #[serde(rename = "@version")]
++    pub version: String,
++    /// One entry per storage device
++    #[serde(rename = "HddInfo", default)]
++    pub hdd_info: Vec<HddInfo>,
++}
++
++/// One storage device (SD card)
++#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
++pub struct HddInfo {
++    /// Index of the device
++    pub number: u8,
++    /// Capacity, GB part
++    pub capacity: u32,
++    /// Capacity, MB part (absent on some cameras)
++    #[serde(rename = "capacityM", default, skip_serializing_if = "Option::is_none")]
++    pub capacity_m: Option<u32>,
++    /// 1 when formatted
++    pub format: u8,
++    /// 1 when mounted
++    pub mount: u8,
++    /// Free space, GB part
++    #[serde(rename = "remainSize")]
++    pub remain_size: u32,
++    /// Free space, MB part
++    #[serde(rename = "remainSizeM", default, skip_serializing_if = "Option::is_none")]
++    pub remain_size_m: Option<u32>,
++}
++
++/// Net3g4gInfo xml (pushed by 4G cameras, msg 255)
++#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
++pub struct Net3g4gInfo {
++    /// XML Version
++    #[serde(rename = "@version")]
++    pub version: String,
++    /// Signal level, 0-5 bars
++    #[serde(rename = "sigIntensityLevel")]
++    pub level: u8,
++    /// Signal value as the camera reports it
++    #[serde(rename = "sigIntensityValue")]
++    pub value: i32,
++    /// Network mode
++    #[serde(rename = "netMode", default, skip_serializing_if = "Option::is_none")]
++    pub net_mode: Option<u32>,
++    /// Operator as MCC+MNC (e.g. 26006)
++    #[serde(rename = "mobileOperator", default, skip_serializing_if = "Option::is_none")]
++    pub mobile_operator: Option<u32>,
++}
+diff --git a/crates/core/src/bc_protocol/settings.rs b/crates/core/src/bc_protocol/settings.rs
+index f9127cd..0004e00 100644
+--- a/crates/core/src/bc_protocol/settings.rs
++++ b/crates/core/src/bc_protocol/settings.rs
+@@ -125,4 +125,50 @@ impl BcCamera {
+         };
+         self.set_xml(MSG_ID_SET_AUDIO_TASK, xml).await
+     }
++
++    /// Push notifications from the camera on/off
++    pub async fn get_push_task(&self) -> Result<ScheduleTask> {
++        self.get_xml(MSG_ID_GET_PUSH_TASK)
++            .await?
++            .push_task
++            .ok_or(Error::Other("Expected PushTask xml"))
++    }
++
++    /// Writes the push setting back (send what [Self::get_push_task] returned, changed)
++    pub async fn set_push_task(&self, push_task: ScheduleTask) -> Result<()> {
++        let xml = BcXml {
++            push_task: Some(push_task),
++            ..Default::default()
++        };
++        self.set_xml(MSG_ID_SET_PUSH_TASK, xml).await
++    }
++
++    /// Storage (SD card) state
++    pub async fn get_hdd_info(&self) -> Result<HddInfoList> {
++        self.get_xml(MSG_ID_GET_HDD_INFO)
++            .await?
++            .hdd_info_list
++            .ok_or(Error::Other("Expected HddInfoList xml"))
++    }
++
++    /// Waits for the next mobile network report a 4G camera sends on its own (every few
++    /// seconds while connected)
++    pub async fn next_net_3g4g_info(&self) -> Result<Net3g4gInfo> {
++        let connection = self.get_connection();
++        let mut sub = connection.subscribe_to_id(MSG_ID_NET_3G4G_INFO).await?;
++        loop {
++            let msg = sub.recv().await?;
++            if let BcBody::ModernMsg(ModernMsg {
++                payload:
++                    Some(BcPayloads::BcXml(BcXml {
++                        net_3g4g_info: Some(info),
++                        ..
++                    })),
++                ..
++            }) = msg.body
++            {
++                return Ok(info);
++            }
++        }
++    }
+ }
+diff --git a/src/ws/mod.rs b/src/ws/mod.rs
+index b713a8d..4609db6 100644
+--- a/src/ws/mod.rs
++++ b/src/ws/mod.rs
+@@ -71,6 +71,24 @@ struct BatteryState {
+     low_power: bool,
+ }
+ 
++#[derive(Debug, Clone, Default, Serialize)]
++struct StorageState {
++    total_gb: f64,
++    free_gb: f64,
++    formatted: bool,
++    mounted: bool,
++}
++
++fn storage_state(h: &neolink_core::bc::xml::HddInfo) -> StorageState {
++    let gb = |g: u32, m: Option<u32>| g as f64 + m.unwrap_or(0) as f64 / 1000.0;
++    StorageState {
++        total_gb: gb(h.capacity, h.capacity_m),
++        free_gb: gb(h.remain_size, h.remain_size_m),
++        formatted: h.format != 0,
++        mounted: h.mount != 0,
++    }
++}
++
+ #[derive(Debug, Clone, Default, Serialize)]
+ struct CameraState {
+     name: String,
+@@ -104,6 +122,16 @@ struct CameraState {
+     post_record_options: Vec<u32>,
+     /// Alarm sound (siren) on detection
+     alarm_sound: Option<bool>,
++    /// Push notifications from the camera (motion in Home Assistant depends on them)
++    push_enabled: Option<bool>,
++    /// SD card
++    storage: Option<StorageState>,
++    /// 4G signal, 0-5 bars
++    signal_level: Option<u8>,
++    /// 4G signal value as the camera reports it
++    signal_value: Option<i32>,
++    /// 4G operator as MCC+MNC
++    mobile_operator: Option<u32>,
+     /// Unix time (s) of the last change
+     updated: u64,
+ }
+@@ -365,10 +393,13 @@ async fn watch_camera(app: App, name: &str, ws: &WebsocketConfig) -> AnyResult<(
+                 // Fill in model, firmware, LED/IR/PIR and battery while the link is up anyway
+                 let refresh = async {
+                     refresh(&app, &name, &camera, false).await;
+-                    if snapshot_every.is_zero() {
+-                        std::future::pending::<()>().await;
+-                    }
+-                    refresh_snapshots(&app, &name, snapshot_every).await;
++                    let snapshots = async {
++                        if snapshot_every.is_zero() {
++                            std::future::pending::<()>().await;
++                        }
++                        refresh_snapshots(&app, &name, snapshot_every).await;
++                    };
++                    tokio::join!(snapshots, follow_mobile_network(&app, &name, &camera));
+                 };
+                 tokio::select! {
+                     _ = refresh => {},
+@@ -497,6 +528,22 @@ async fn refresh(app: &App, name: &str, camera: &NeoInstance, active: bool) {
+         Ok(a) => update(app, name, |s| s.alarm_sound = Some(a.enable != 0)).await,
+         Err(e) => log::debug!("{name}: alarm sound read failed: {e:#}"),
+     }
++    match read(camera, active, |c| {
++        Box::pin(async move { AnyResult::Ok(c.get_push_task().await?) })
++    })
++    .await
++    {
++        Ok(p) => update(app, name, |s| s.push_enabled = Some(p.enable != 0)).await,
++        Err(e) => log::debug!("{name}: push setting read failed: {e:#}"),
++    }
++    match read(camera, active, |c| {
++        Box::pin(async move { AnyResult::Ok(c.get_hdd_info().await?) })
++    })
++    .await
++    {
++        Ok(h) => update(app, name, |s| s.storage = h.hdd_info.first().map(storage_state)).await,
++        Err(e) => log::debug!("{name}: storage read failed: {e:#}"),
++    }
+     match read(camera, active, |c| {
+         Box::pin(async move { AnyResult::Ok(c.battery_info().await?) })
+     })
+@@ -600,6 +647,36 @@ async fn take_snapshot(app: &App, name: &str, active: bool) -> AnyResult<Vec<u8>
+     Ok(jpeg)
+ }
+ 
++/// While connected, keeps the 4G signal a mobile camera reports every few seconds; a camera
++/// without 4G never sends it and this just waits
++async fn follow_mobile_network(app: &App, name: &str, camera: &NeoInstance) {
++    let mut last = None;
++    loop {
++        match read(camera, false, |c| {
++            Box::pin(async move { AnyResult::Ok(c.next_net_3g4g_info().await?) })
++        })
++        .await
++        {
++            Ok(info) => {
++                let now = (info.level, info.value, info.mobile_operator);
++                if last != Some(now) {
++                    last = Some(now);
++                    update(app, name, |s| {
++                        s.signal_level = Some(info.level);
++                        s.signal_value = Some(info.value);
++                        s.mobile_operator = info.mobile_operator;
++                    })
++                    .await;
++                }
++            }
++            Err(e) => {
++                log::debug!("{name}: mobile network report failed: {e:#}");
++                sleep(Duration::from_secs(30)).await;
++            }
++        }
++    }
++}
++
+ /// Waits for the connection a motion notification brings (passive) and keeps its still both as
+ /// the event snapshot and as the latest snapshot
+ async fn take_event_snapshot(app: &App, name: &str) -> AnyResult<()> {
+@@ -888,6 +965,18 @@ async fn command(app: &App, request: &Request) -> AnyResult<Value> {
+             .await?;
+             update(app, name, |s| record_cfg_state(s, &r)).await;
+         }
++        "push" => {
++            let on = arg_bool(args, "on")?;
++            read(&camera, true, move |c| {
++                Box::pin(async move {
++                    let mut p = c.get_push_task().await?;
++                    p.enable = on as u8;
++                    AnyResult::Ok(c.set_push_task(p).await?)
++                })
++            })
++            .await?;
++            update(app, name, |s| s.push_enabled = Some(on)).await;
++        }
+         "alarm_sound" => {
+             let on = arg_bool(args, "on")?;
+             read(&camera, true, move |c| {
+-- 
+2.54.0 (Apple Git-157)
+

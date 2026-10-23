@@ -1,0 +1,25 @@
+configuration:
+  log_level:
+    name: Poziom dziennika
+    description: Ile szczegółów zapisywać w dzienniku. debug pokazuje m.in. treść każdego powiadomienia push Reolinka (linia "push payload:") - do diagnostyki, potem wróć do info.
+  battery_minutes:
+    name: Odczyt baterii (min)
+    description: Co ile odczytać baterię, gdy kamera i tak jest połączona (kamera nie jest budzona). 0 = wyłączone.
+  motion:
+    name: Nasłuch ruchu
+    description: Zdarzenia ruchu przy połączonej kamerze. Przy 4G zwiększa zużycie baterii i danych.
+  push:
+    name: Ruch z powiadomień push
+    description: Kamera zgłasza ruch (PIR) przez powiadomienia Reolinka. Działa także, gdy kamera śpi; po powiadomieniu Neolink łączy się z nią na 30 s.
+  motion_seconds:
+    name: Czas wykrycia ruchu (s)
+    description: Jak długo czujnik ruchu pozostaje włączony po powiadomieniu. Kolejne powiadomienie liczy czas od nowa.
+  cameras:
+    name: Kamery
+    description: >-
+      name (litery, cyfry, _; część adresu RTSP), uid (16 znaków od 9527), username (zwykle admin),
+      password (hasło URZĄDZENIA z aplikacji Reolink), discovery (cellular dla 4G), stream
+      (subStream oszczędza dane), idle_disconnect (rozłączaj w bezczynności).
+network:
+  8554/tcp: RTSP (obraz z kamer, z hasłem)
+  3002/tcp: API WebSocket (domyślnie tylko w sieci HA)

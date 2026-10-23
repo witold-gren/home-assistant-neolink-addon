@@ -1,0 +1,93 @@
+From b68982bf877098ac24f2488109c793cef51f9fc4 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Witold=20Gre=C5=84?= <witold.gren@gmail.com>
+Date: Mon, 19 Oct 2026 18:40:28 +0200
+Subject: [PATCH] push: accept unpadded base64 in FCM crypto headers
+
+Reolink sends dh=/salt= without '=' padding; strict URL_SAFE failed with
+"Invalid padding". The undecodable message was never acknowledged, so
+FCM redelivered it on every reconnect (loop every ~3 s). Decode leniently
+(padding optional, standard or URL-safe alphabet).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vendor/fcm-push-listener/src/push.rs | 38 +++++++++++++++++++++++-----
+ 1 file changed, 32 insertions(+), 6 deletions(-)
+
+diff --git a/vendor/fcm-push-listener/src/push.rs b/vendor/fcm-push-listener/src/push.rs
+index e3bb1f4..f879738 100644
+--- a/vendor/fcm-push-listener/src/push.rs
++++ b/vendor/fcm-push-listener/src/push.rs
+@@ -52,8 +52,6 @@ pub struct DataMessage {
+ 
+ impl DataMessage {
+     fn decode(eckey: &EcKeyComponents, auth_secret: &[u8], bytes: &[u8]) -> Result<Self, Error> {
+-        use base64::engine::general_purpose::URL_SAFE;
+-        use base64::Engine;
+         use ece::legacy::AesGcmEncryptedBlock;
+         use prost::Message;
+ 
+@@ -75,8 +73,7 @@ impl DataMessage {
+                     // crypto_key format: dh=abc... - Reolink (and other senders) append
+                     // more parameters after ';' (e.g. "dh=...;p256ecdsa=..."), so take
+                     // only the dh= value instead of everything after the first 3 bytes.
+-                    kex = URL_SAFE
+-                        .decode(header_param(&field.value, "dh"))
++                    kex = decode_b64_lenient(header_param(&field.value, "dh"))
+                         .map_err(|e| Error::Base64Decode("FCM message crypto-key", e))?;
+ 
+                     if !salt.is_empty() {
+@@ -85,8 +82,7 @@ impl DataMessage {
+                 }
+                 "encryption" => {
+                     // encryption format: salt=abc... (possibly followed by ";rs=...")
+-                    salt = URL_SAFE
+-                        .decode(header_param(&field.value, "salt"))
++                    salt = decode_b64_lenient(header_param(&field.value, "salt"))
+                         .map_err(|e| Error::Base64Decode("FCM message encryption params", e))?;
+ 
+                     if !kex.is_empty() {
+@@ -287,6 +283,27 @@ pub fn new_heartbeat_ack() -> BytesMut {
+     bytes
+ }
+ 
++/// Base64 as senders really write it: Reolink omits the '=' padding (strict
++/// URL_SAFE failed with "Invalid padding"), others may use the standard
++/// alphabet or quote the value.
++fn decode_b64_lenient(value: &str) -> Result<Vec<u8>, base64::DecodeError> {
++    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
++    use base64::Engine;
++
++    let cleaned: String = value
++        .trim()
++        .trim_matches('"')
++        .trim_end_matches('=')
++        .chars()
++        .map(|c| match c {
++            '+' => '-',
++            '/' => '_',
++            c => c,
++        })
++        .collect();
++    URL_SAFE_NO_PAD.decode(cleaned)
++}
++
+ /// Value of `name=` in a ';'-separated header such as "dh=abc;p256ecdsa=def".
+ /// Falls back to the whole value when the parameter is missing, so the decode
+ /// error still names the header.
+@@ -312,4 +329,13 @@ mod header_param_tests {
+         assert_eq!(header_param("salt=xyz;rs=4096", "salt"), "xyz");
+         assert_eq!(header_param("salt=xyz", "salt"), "xyz");
+     }
++
++    #[test]
++    fn base64_with_or_without_padding() {
++        use super::decode_b64_lenient;
++        assert_eq!(decode_b64_lenient("YWJjZA").unwrap(), b"abcd");
++        assert_eq!(decode_b64_lenient("YWJjZA==").unwrap(), b"abcd");
++        assert_eq!(decode_b64_lenient("-_8").unwrap(), vec![0xfb, 0xff]);
++        assert_eq!(decode_b64_lenient("+/8=").unwrap(), vec![0xfb, 0xff]);
++    }
+ }
+-- 
+2.54.0 (Apple Git-157)
+
