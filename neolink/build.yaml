@@ -1,0 +1,5 @@
+# Runtime libraries (GStreamer) from the official Neolink image; the binary is the fork built from
+# source in the Dockerfile.
+build_from:
+  amd64: quantumentangledandy/neolink:latest
+  aarch64: quantumentangledandy/neolink:latest

@@ -1,0 +1,621 @@
+From 5dcc505f08aacbdb4147e84819c02e6f10fca257 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Witold=20Gre=C5=84?= <witold.gren@gmail.com>
+Date: Sat, 17 Oct 2026 18:53:27 +0200
+Subject: [PATCH 6/7] ws: PIR sensitivity, recording, post-record time, alarm
+ sound, event snapshot
+
+Core: RecordCfg (54/55), Record (81/82) and AudioTask (231/232) xml with
+get/set, a generic probe(msg_id) for discovering what a camera supports.
+
+ws state: pir_sensitivity, pir_reduce_false_alarm, recording,
+post_record (+ allowed values), alarm_sound, read passively on connect;
+commands to set each. A motion push notification now also keeps a still
+of the event (<camera>.event.jpg, /snapshot/<camera>?event=true,
+event_snapshot_at). Probe command for diagnostics.
+
+Tested on a Reolink Go Plus (firmware v3.0.0.662).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/core/src/bc/model.rs             |  12 ++
+ crates/core/src/bc/xml.rs               |  90 ++++++++++
+ crates/core/src/bc_protocol.rs          |   1 +
+ crates/core/src/bc_protocol/settings.rs | 128 ++++++++++++++
+ src/ws/mod.rs                           | 215 ++++++++++++++++++++++--
+ 5 files changed, 433 insertions(+), 13 deletions(-)
+ create mode 100644 crates/core/src/bc_protocol/settings.rs
+
+diff --git a/crates/core/src/bc/model.rs b/crates/core/src/bc/model.rs
+index a1e1cf2..6a6a80a 100644
+--- a/crates/core/src/bc/model.rs
++++ b/crates/core/src/bc/model.rs
+@@ -48,6 +48,18 @@ pub const MSG_ID_UPDATE_USER_LIST: u32 = 59;
+ pub const MSG_ID_VERSION: u32 = 80;
+ /// Ping messages have this ID
+ pub const MSG_ID_PING: u32 = 93;
++/// Get recording timing (RecordCfg)
++pub const MSG_ID_GET_RECORD_CFG: u32 = 54;
++/// Set recording timing (RecordCfg)
++pub const MSG_ID_SET_RECORD_CFG: u32 = 55;
++/// Get recording on/off (Record)
++pub const MSG_ID_GET_RECORD: u32 = 81;
++/// Set recording on/off (Record)
++pub const MSG_ID_SET_RECORD: u32 = 82;
++/// Set the alarm sound on detection (AudioTask)
++pub const MSG_ID_SET_AUDIO_TASK: u32 = 231;
++/// Get the alarm sound on detection (AudioTask)
++pub const MSG_ID_GET_AUDIO_TASK: u32 = 232;
+ /// General system info messages have this ID
+ pub const MSG_ID_GET_GENERAL: u32 = 104;
+ /// Setting general system info (clock mostly) messages have this ID
+diff --git a/crates/core/src/bc/xml.rs b/crates/core/src/bc/xml.rs
+index 3986ae0..e194767 100644
+--- a/crates/core/src/bc/xml.rs
++++ b/crates/core/src/bc/xml.rs
+@@ -141,6 +141,15 @@ pub struct BcXml {
+     /// Read and write users
+     #[serde(rename = "UserList", skip_serializing_if = "Option::is_none")]
+     pub user_list: Option<UserList>,
++    /// Recording timing: post-record time, pre-record time, file length
++    #[serde(rename = "RecordCfg", skip_serializing_if = "Option::is_none")]
++    pub record_cfg: Option<RecordCfg>,
++    /// Recording on/off with its schedule
++    #[serde(rename = "Record", skip_serializing_if = "Option::is_none")]
++    pub record: Option<ScheduleTask>,
++    /// Alarm sound (siren) on detection on/off with its schedule
++    #[serde(rename = "AudioTask", skip_serializing_if = "Option::is_none")]
++    pub audio_task: Option<ScheduleTask>,
+ }
+ 
+ impl BcXml {
+@@ -1965,3 +1974,84 @@ fn test_empty_floodlight_status_list() {
+         _ => panic!(),
+     }
+ }
++
++/// RecordCfg xml (get 54, set 55)
++#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
++pub struct RecordCfg {
++    /// XML Version
++    #[serde(rename = "@version")]
++    pub version: String,
++    /// Channel ID
++    #[serde(rename = "channelId")]
++    pub channel_id: u8,
++    /// Overwrite the oldest recordings when the card is full
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub cycle: Option<u8>,
++    /// Seconds recorded after the detection ended
++    #[serde(rename = "recordDelayTime")]
++    pub record_delay_time: u32,
++    /// Seconds recorded before the detection
++    #[serde(rename = "preRecordTime", default, skip_serializing_if = "Option::is_none")]
++    pub pre_record_time: Option<u32>,
++    /// Length of one recording file (minutes)
++    #[serde(rename = "packageTime", default, skip_serializing_if = "Option::is_none")]
++    pub package_time: Option<u32>,
++    /// Allowed `cycle` values
++    #[serde(rename = "cyclelist", default, skip_serializing_if = "Option::is_none")]
++    pub cycle_list: Option<ItemList>,
++    /// Allowed `recordDelayTime` values
++    #[serde(rename = "timeList", default, skip_serializing_if = "Option::is_none")]
++    pub time_list: Option<TimeList>,
++}
++
++/// A list of `<item>` values
++#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
++pub struct ItemList {
++    /// The values
++    #[serde(default)]
++    pub item: Vec<u32>,
++}
++
++/// A list of `<time>` values
++#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
++pub struct TimeList {
++    /// The values
++    #[serde(default)]
++    pub time: Vec<u32>,
++}
++
++/// An on/off task with a schedule per detection type: Record (get 81, set 82),
++/// AudioTask (get 232, set 231), PushTask (get 219, set 218)
++#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
++pub struct ScheduleTask {
++    /// XML Version
++    #[serde(rename = "@version")]
++    pub version: String,
++    /// Channel ID
++    #[serde(rename = "channelId")]
++    pub channel_id: u8,
++    /// On or off
++    pub enable: u8,
++    /// Schedules per detection type
++    #[serde(rename = "typeScheduleList", default, skip_serializing_if = "Option::is_none")]
++    pub type_schedule_list: Option<TypeScheduleList>,
++}
++
++/// typeScheduleList xml
++#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
++pub struct TypeScheduleList {
++    /// One schedule per detection type
++    #[serde(default)]
++    pub item: Vec<TypeSchedule>,
++}
++
++/// A schedule for one detection type (`people`, `vehicle`, `other`)
++#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
++pub struct TypeSchedule {
++    /// Detection type
++    #[serde(rename = "type")]
++    pub kind: String,
++    /// One character per hour of the week, 1 = active
++    #[serde(rename = "valueTable")]
++    pub value_table: String,
++}
+diff --git a/crates/core/src/bc_protocol.rs b/crates/core/src/bc_protocol.rs
+index b3ad9d9..671e94d 100644
+--- a/crates/core/src/bc_protocol.rs
++++ b/crates/core/src/bc_protocol.rs
+@@ -27,6 +27,7 @@ mod logout;
+ mod motion;
+ mod ping;
+ mod pirstate;
++mod settings;
+ mod ptz;
+ mod pushinfo;
+ mod reboot;
+diff --git a/crates/core/src/bc_protocol/settings.rs b/crates/core/src/bc_protocol/settings.rs
+new file mode 100644
+index 0000000..f9127cd
+--- /dev/null
++++ b/crates/core/src/bc_protocol/settings.rs
+@@ -0,0 +1,128 @@
++use super::{BcCamera, Error, Result};
++use crate::bc::{model::*, xml::*};
++
++impl BcCamera {
++    fn channel_query(&self, msg_id: u32, msg_num: u16, payload: Option<BcPayloads>) -> Bc {
++        Bc {
++            meta: BcMeta {
++                msg_id,
++                channel_id: self.channel_id,
++                msg_num,
++                response_code: 0,
++                stream_type: 0,
++                class: 0x6414,
++            },
++            body: BcBody::ModernMsg(ModernMsg {
++                extension: Some(Extension {
++                    channel_id: Some(self.channel_id),
++                    ..Default::default()
++                }),
++                payload,
++            }),
++        }
++    }
++
++    /// Sends a bare channel query with the given message id and returns the camera's response
++    /// code. Meant for discovering what a camera supports: with the camera's `debug` option the
++    /// reply payload is printed as text.
++    pub async fn probe(&self, msg_id: u32) -> Result<u16> {
++        let msg_num = self.new_message_num();
++        let connection = self.get_connection();
++        let mut sub = connection.subscribe(msg_id, msg_num).await?;
++        sub.send(self.channel_query(msg_id, msg_num, None)).await?;
++        Ok(sub.recv().await?.meta.response_code)
++    }
++
++    /// Queries `msg_id` for the channel and returns the reply's XML
++    async fn get_xml(&self, msg_id: u32) -> Result<BcXml> {
++        let msg_num = self.new_message_num();
++        let connection = self.get_connection();
++        let mut sub = connection.subscribe(msg_id, msg_num).await?;
++        sub.send(self.channel_query(msg_id, msg_num, None)).await?;
++        let msg = sub.recv().await?;
++        if msg.meta.response_code != 200 {
++            return Err(Error::CameraServiceUnavailable {
++                id: msg.meta.msg_id,
++                code: msg.meta.response_code,
++            });
++        }
++        match msg.body {
++            BcBody::ModernMsg(ModernMsg {
++                payload: Some(BcPayloads::BcXml(xml)),
++                ..
++            }) => Ok(xml),
++            _ => Err(Error::UnintelligibleReply {
++                reply: std::sync::Arc::new(Box::new(msg)),
++                why: "Expected an xml payload",
++            }),
++        }
++    }
++
++    /// Sends `xml` to the channel with `msg_id` and checks the camera accepted it
++    async fn set_xml(&self, msg_id: u32, xml: BcXml) -> Result<()> {
++        let msg_num = self.new_message_num();
++        let connection = self.get_connection();
++        let mut sub = connection.subscribe(msg_id, msg_num).await?;
++        sub.send(self.channel_query(msg_id, msg_num, Some(BcPayloads::BcXml(xml))))
++            .await?;
++        let msg = sub.recv().await?;
++        if msg.meta.response_code != 200 {
++            return Err(Error::CameraServiceUnavailable {
++                id: msg.meta.msg_id,
++                code: msg.meta.response_code,
++            });
++        }
++        Ok(())
++    }
++
++    /// Recording timing: post-record time and its allowed values
++    pub async fn get_record_cfg(&self) -> Result<RecordCfg> {
++        self.get_xml(MSG_ID_GET_RECORD_CFG)
++            .await?
++            .record_cfg
++            .ok_or(Error::Other("Expected RecordCfg xml"))
++    }
++
++    /// Writes recording timing back (send what [Self::get_record_cfg] returned, changed)
++    pub async fn set_record_cfg(&self, record_cfg: RecordCfg) -> Result<()> {
++        let xml = BcXml {
++            record_cfg: Some(record_cfg),
++            ..Default::default()
++        };
++        self.set_xml(MSG_ID_SET_RECORD_CFG, xml).await
++    }
++
++    /// Recording (to the SD card) on/off
++    pub async fn get_record(&self) -> Result<ScheduleTask> {
++        self.get_xml(MSG_ID_GET_RECORD)
++            .await?
++            .record
++            .ok_or(Error::Other("Expected Record xml"))
++    }
++
++    /// Writes recording on/off back (send what [Self::get_record] returned, changed)
++    pub async fn set_record(&self, record: ScheduleTask) -> Result<()> {
++        let xml = BcXml {
++            record: Some(record),
++            ..Default::default()
++        };
++        self.set_xml(MSG_ID_SET_RECORD, xml).await
++    }
++
++    /// Alarm sound (siren) on detection on/off
++    pub async fn get_audio_task(&self) -> Result<ScheduleTask> {
++        self.get_xml(MSG_ID_GET_AUDIO_TASK)
++            .await?
++            .audio_task
++            .ok_or(Error::Other("Expected AudioTask xml"))
++    }
++
++    /// Writes the alarm sound setting back (send what [Self::get_audio_task] returned, changed)
++    pub async fn set_audio_task(&self, audio_task: ScheduleTask) -> Result<()> {
++        let xml = BcXml {
++            audio_task: Some(audio_task),
++            ..Default::default()
++        };
++        self.set_xml(MSG_ID_SET_AUDIO_TASK, xml).await
++    }
++}
+diff --git a/src/ws/mod.rs b/src/ws/mod.rs
+index 1457ec8..b713a8d 100644
+--- a/src/ws/mod.rs
++++ b/src/ws/mod.rs
+@@ -90,6 +90,20 @@ struct CameraState {
+     last_motion: Option<u64>,
+     /// Unix time (s) of the cached snapshot
+     snapshot_at: Option<u64>,
++    /// Unix time (s) of the snapshot taken after the last motion notification
++    event_snapshot_at: Option<u64>,
++    /// PIR sensitivity (Reolink app: 1-100)
++    pir_sensitivity: Option<u8>,
++    /// PIR "reduce false alarms"
++    pir_reduce_false_alarm: Option<bool>,
++    /// Recording to the SD card
++    recording: Option<bool>,
++    /// Seconds recorded after a detection
++    post_record: Option<u32>,
++    /// Allowed `post_record` values
++    post_record_options: Vec<u32>,
++    /// Alarm sound (siren) on detection
++    alarm_sound: Option<bool>,
+     /// Unix time (s) of the last change
+     updated: u64,
+ }
+@@ -99,6 +113,8 @@ struct Shared {
+     token: Option<String>,
+     states: RwLock<HashMap<String, CameraState>>,
+     snapshots: RwLock<HashMap<String, (u64, Vec<u8>)>>,
++    /// Snapshots taken after a motion notification (`<camera>.event.jpg`)
++    event_snapshots: RwLock<HashMap<String, (u64, Vec<u8>)>>,
+     snapshot_dir: Option<PathBuf>,
+     events: broadcast::Sender<String>,
+ }
+@@ -122,7 +138,8 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
+         reactor,
+         token: ws_config.token.clone().filter(|t| !t.is_empty()),
+         states: Default::default(),
+-        snapshots: RwLock::new(load_snapshots(ws_config.snapshot_dir.as_deref())),
++        snapshots: RwLock::new(load_snapshots(ws_config.snapshot_dir.as_deref(), "")),
++        event_snapshots: RwLock::new(load_snapshots(ws_config.snapshot_dir.as_deref(), ".event")),
+         snapshot_dir: ws_config.snapshot_dir.as_ref().map(PathBuf::from),
+         events,
+     });
+@@ -206,8 +223,10 @@ async fn watch_cameras(
+                 continue;
+             }
+             let snapshot_at = app.snapshots.read().await.get(&name).map(|(t, _)| *t);
++            let event_snapshot_at = app.event_snapshots.read().await.get(&name).map(|(t, _)| *t);
+             update(&app, &name, |s| {
+                 s.snapshot_at = snapshot_at;
++                s.event_snapshot_at = event_snapshot_at;
+                 s.uid = uid.clone();
+                 s.motion_enabled = ws.enable_motion || push;
+                 if s.motion_enabled && s.motion.is_none() {
+@@ -293,6 +312,16 @@ async fn watch_camera(app: App, name: &str, ws: &WebsocketConfig) -> AnyResult<(
+                     s.last_motion = Some(now());
+                 })
+                 .await;
++                // The notification wakes the camera for 30 s: keep a still of this event
++                let (event_app, event_name) = (app.clone(), name.clone());
++                tokio::spawn(async move {
++                    let (app, name) = (event_app, event_name);
++                    match timeout(Duration::from_secs(60), take_event_snapshot(&app, &name)).await {
++                        Ok(Ok(_)) => {}
++                        Ok(Err(e)) => log::info!("{name}: event snapshot failed: {e:#}"),
++                        Err(_) => log::info!("{name}: event snapshot: camera did not connect"),
++                    }
++                });
+                 // Each further notification restarts the countdown
+                 loop {
+                     tokio::select! {
+@@ -434,9 +463,40 @@ async fn refresh(app: &App, name: &str, camera: &NeoInstance, active: bool) {
+     })
+     .await
+     {
+-        Ok(p) => update(app, name, |s| s.pir = Some(p.enable != 0)).await,
++        Ok(p) => {
++            update(app, name, |s| {
++                s.pir = Some(p.enable != 0);
++                s.pir_sensitivity = Some(p.sensiValue);
++                s.pir_reduce_false_alarm = Some(p.reduceFalseAlarm != 0);
++            })
++            .await
++        }
+         Err(e) => log::debug!("{name}: PIR state read failed: {e:#}"),
+     }
++    match read(camera, active, |c| {
++        Box::pin(async move { AnyResult::Ok(c.get_record().await?) })
++    })
++    .await
++    {
++        Ok(r) => update(app, name, |s| s.recording = Some(r.enable != 0)).await,
++        Err(e) => log::debug!("{name}: recording read failed: {e:#}"),
++    }
++    match read(camera, active, |c| {
++        Box::pin(async move { AnyResult::Ok(c.get_record_cfg().await?) })
++    })
++    .await
++    {
++        Ok(r) => update(app, name, |s| record_cfg_state(s, &r)).await,
++        Err(e) => log::debug!("{name}: recording settings read failed: {e:#}"),
++    }
++    match read(camera, active, |c| {
++        Box::pin(async move { AnyResult::Ok(c.get_audio_task().await?) })
++    })
++    .await
++    {
++        Ok(a) => update(app, name, |s| s.alarm_sound = Some(a.enable != 0)).await,
++        Err(e) => log::debug!("{name}: alarm sound read failed: {e:#}"),
++    }
+     match read(camera, active, |c| {
+         Box::pin(async move { AnyResult::Ok(c.battery_info().await?) })
+     })
+@@ -447,11 +507,17 @@ async fn refresh(app: &App, name: &str, camera: &NeoInstance, active: bool) {
+     }
+ }
+ 
++fn record_cfg_state(s: &mut CameraState, r: &neolink_core::bc::xml::RecordCfg) {
++    s.post_record = Some(r.record_delay_time);
++    s.post_record_options = r.time_list.as_ref().map(|t| t.time.clone()).unwrap_or_default();
++}
++
+ #[derive(Deserialize)]
+ struct AuthQuery {
+     token: Option<String>,
+     max_age: Option<u64>,
+     cached: Option<bool>,
++    event: Option<bool>,
+ }
+ 
+ fn authorized(app: &App, headers: &HeaderMap, query: &AuthQuery) -> bool {
+@@ -491,6 +557,12 @@ async fn snapshot(
+     if !app.states.read().await.contains_key(&name) {
+         return (StatusCode::NOT_FOUND, format!("unknown camera `{name}`")).into_response();
+     }
++    if query.event == Some(true) {
++        return match app.event_snapshots.read().await.get(&name) {
++            Some((_, jpeg)) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg.clone()).into_response(),
++            None => (StatusCode::NOT_FOUND, "no event snapshot").into_response(),
++        };
++    }
+     if query.cached == Some(true) {
+         return match app.snapshots.read().await.get(&name) {
+             Some((_, jpeg)) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg.clone()).into_response(),
+@@ -523,18 +595,38 @@ async fn take_snapshot(app: &App, name: &str, active: bool) -> AnyResult<Vec<u8>
+         .await
+         .insert(name.to_string(), (taken, jpeg.clone()));
+     update(app, name, |s| s.snapshot_at = Some(taken)).await;
++    save_snapshot(app, name, &jpeg).await;
++    log::debug!("{name}: snapshot taken ({} bytes, active: {active})", jpeg.len());
++    Ok(jpeg)
++}
++
++/// Waits for the connection a motion notification brings (passive) and keeps its still both as
++/// the event snapshot and as the latest snapshot
++async fn take_event_snapshot(app: &App, name: &str) -> AnyResult<()> {
++    let jpeg = take_snapshot(app, name, false).await?;
++    let taken = now();
++    app.event_snapshots
++        .write()
++        .await
++        .insert(name.to_string(), (taken, jpeg.clone()));
++    save_snapshot(app, &format!("{name}.event"), &jpeg).await;
++    update(app, name, |s| s.event_snapshot_at = Some(taken)).await;
++    log::info!("{name}: event snapshot saved ({} bytes)", jpeg.len());
++    Ok(())
++}
++
++async fn save_snapshot(app: &App, file: &str, jpeg: &[u8]) {
+     if let Some(dir) = &app.snapshot_dir {
+-        let path = dir.join(format!("{name}.jpg"));
+-        if let Err(e) = tokio::fs::write(&path, &jpeg).await {
+-            log::warn!("{name}: cannot save snapshot to {}: {e}", path.display());
++        let path = dir.join(format!("{file}.jpg"));
++        if let Err(e) = tokio::fs::write(&path, jpeg).await {
++            log::warn!("{file}: cannot save snapshot to {}: {e}", path.display());
+         }
+     }
+-    log::debug!("{name}: snapshot taken ({} bytes, active: {active})", jpeg.len());
+-    Ok(jpeg)
+ }
+ 
+-/// Reads `<dir>/<camera>.jpg` files saved by earlier runs; the file time is the snapshot time
+-fn load_snapshots(dir: Option<&str>) -> HashMap<String, (u64, Vec<u8>)> {
++/// Reads `<dir>/<camera><suffix>.jpg` files saved by earlier runs; the file time is the
++/// snapshot time
++fn load_snapshots(dir: Option<&str>, suffix: &str) -> HashMap<String, (u64, Vec<u8>)> {
+     let mut snapshots = HashMap::new();
+     let Some(dir) = dir else {
+         return snapshots;
+@@ -551,10 +643,18 @@ fn load_snapshots(dir: Option<&str>) -> HashMap<String, (u64, Vec<u8>)> {
+         if path.extension().and_then(|e| e.to_str()) != Some("jpg") {
+             continue;
+         }
+-        let (Some(name), Ok(jpeg)) = (
+-            path.file_stem().and_then(|n| n.to_str()),
+-            std::fs::read(&path),
+-        ) else {
++        let Some(stem) = path.file_stem().and_then(|n| n.to_str()) else {
++            continue;
++        };
++        // Camera names are [A-Za-z0-9_], so a dot only comes from a suffix
++        let name = match stem.strip_suffix(suffix) {
++            Some(name) if !suffix.is_empty() || !stem.contains('.') => name,
++            _ => continue,
++        };
++        if name.is_empty() || name.contains('.') {
++            continue;
++        }
++        let Ok(jpeg) = std::fs::read(&path) else {
+             continue;
+         };
+         let taken = entry
+@@ -724,6 +824,82 @@ async fn command(app: &App, request: &Request) -> AnyResult<Value> {
+             .await?;
+             update(app, name, |s| s.pir = Some(on)).await;
+         }
++        "pir_sensitivity" | "pir_reduce_false_alarm" => {
++            let (sensitivity, reduce) = if request.command == "pir_sensitivity" {
++                let v = args
++                    .get("value")
++                    .and_then(Value::as_u64)
++                    .filter(|v| (1..=100).contains(v))
++                    .ok_or_else(|| anyhow!("`value` must be an integer 1-100"))?;
++                (Some(v as u8), None)
++            } else {
++                (None, Some(arg_bool(args, "on")?))
++            };
++            let p = read(&camera, true, move |c| {
++                Box::pin(async move {
++                    let mut p = c.get_pirstate().await?;
++                    if let Some(v) = sensitivity {
++                        p.sensiValue = v;
++                    }
++                    if let Some(on) = reduce {
++                        p.reduceFalseAlarm = on as u8;
++                    }
++                    let (value, reduce) = (p.sensiValue, p.reduceFalseAlarm);
++                    c.set_pirstate(p).await?;
++                    AnyResult::Ok((value, reduce))
++                })
++            })
++            .await?;
++            update(app, name, |s| {
++                s.pir_sensitivity = Some(p.0);
++                s.pir_reduce_false_alarm = Some(p.1 != 0);
++            })
++            .await;
++        }
++        "recording" => {
++            let on = arg_bool(args, "on")?;
++            read(&camera, true, move |c| {
++                Box::pin(async move {
++                    let mut r = c.get_record().await?;
++                    r.enable = on as u8;
++                    AnyResult::Ok(c.set_record(r).await?)
++                })
++            })
++            .await?;
++            update(app, name, |s| s.recording = Some(on)).await;
++        }
++        "post_record" => {
++            let seconds = args
++                .get("seconds")
++                .and_then(Value::as_u64)
++                .ok_or_else(|| anyhow!("missing integer argument `seconds`"))? as u32;
++            let r = read(&camera, true, move |c| {
++                Box::pin(async move {
++                    let mut r = c.get_record_cfg().await?;
++                    let allowed = r.time_list.as_ref().map(|t| t.time.clone()).unwrap_or_default();
++                    if !allowed.is_empty() && !allowed.contains(&seconds) {
++                        return Err(anyhow!("`seconds` must be one of {allowed:?}"));
++                    }
++                    r.record_delay_time = seconds;
++                    c.set_record_cfg(r.clone()).await?;
++                    AnyResult::Ok(r)
++                })
++            })
++            .await?;
++            update(app, name, |s| record_cfg_state(s, &r)).await;
++        }
++        "alarm_sound" => {
++            let on = arg_bool(args, "on")?;
++            read(&camera, true, move |c| {
++                Box::pin(async move {
++                    let mut a = c.get_audio_task().await?;
++                    a.enable = on as u8;
++                    AnyResult::Ok(c.set_audio_task(a).await?)
++                })
++            })
++            .await?;
++            update(app, name, |s| s.alarm_sound = Some(on)).await;
++        }
+         "reboot" => {
+             read(&camera, true, |c| {
+                 Box::pin(async move { AnyResult::Ok(c.reboot().await?) })
+@@ -748,6 +924,19 @@ async fn command(app: &App, request: &Request) -> AnyResult<Value> {
+             let jpeg = take_snapshot(app, name, true).await?;
+             return Ok(json!({"jpeg": BASE64.encode(jpeg)}));
+         }
++        "probe" => {
++            // Diagnostics: query a message id; with the camera's `debug` option the reply XML
++            // is printed to the log
++            let msg_id = args
++                .get("msg_id")
++                .and_then(Value::as_u64)
++                .ok_or_else(|| anyhow!("missing integer argument `msg_id`"))? as u32;
++            let code = read(&camera, true, move |c| {
++                Box::pin(async move { AnyResult::Ok(c.probe(msg_id).await?) })
++            })
++            .await?;
++            return Ok(json!({"msg_id": msg_id, "response_code": code}));
++        }
+         "wakeup" => {
+             let minutes = args
+                 .get("minutes")
+-- 
+2.54.0 (Apple Git-157)
+

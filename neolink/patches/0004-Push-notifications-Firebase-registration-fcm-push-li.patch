@@ -1,0 +1,591 @@
+From e8704c8ade246440de78d3949b34192e908c0ca5 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Witold=20Gre=C5=84?= <witold.gren@gmail.com>
+Date: Sat, 17 Oct 2026 16:54:13 +0200
+Subject: [PATCH 4/7] Push notifications: Firebase registration
+ (fcm-push-listener 4), motion in ws API
+
+The legacy GCM registration used by fcm-push-listener 2 is rejected
+(PHONE_REGISTRATION_ERROR) since June 2024. Port the listener to
+fcm-push-listener 4 (Firebase installation + FCM register with the
+Reolink Android app IDs, heartbeat acks) and enable the pushnoti
+feature by default.
+
+ws: a push notification sets motion for motion_timeout seconds (default
+30, restarted by further notifications) and last_motion; snapshot_at
+tells clients when the cached snapshot changed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Cargo.lock             | Bin 100914 -> 124106 bytes
+ Cargo.toml             |   6 ++-
+ src/common/pushnoti.rs |  87 ++++++++++++++++++++++++++---------------
+ src/config.rs          |   8 ++++
+ src/ws/mod.rs          |  66 ++++++++++++++++++++++++++++---
+ 5 files changed, 128 insertions(+), 39 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index f5255fd726c705812e1c03fdc016ac65c2743926..376edaa235633df1d0b9e03833dcb97ae1d0b137 100644
+GIT binary patch
+delta 13914
+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
+
+delta 3532
+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
+S2#1<^Bg228PMrM`?D;E6ZfNoV
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 82c6342..fde33d4 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -21,7 +21,8 @@ clap = { version = "4.2.2", features = ["derive", "cargo"] }
+ crossbeam-channel = {version = "0.5.8", optional = true}
+ dirs = {version = "5.0.1", optional = true}
+ env_logger = "0.11.3"
+-fcm-push-listener = {version = "2.0.3", optional = true}
++fcm-push-listener = {version = "4.1.1", optional = true}
++reqwest = {version = "0.13", optional = true}
+ futures = "0.3.28"
+ gstreamer = {version = "0.23.0", optional = true}
+ gstreamer-app = { version = "0.23.0", features = ["v1_20"], optional = true }
+@@ -48,7 +49,7 @@ validator = {version="0.18.1", features = ["derive"] }
+ tikv-jemallocator = "0.5"
+ 
+ [features]
+-default = ["gstreamer"]
++default = ["gstreamer", "pushnoti"]
+ gstreamer = [
+   "dep:gstreamer",
+   "dep:gstreamer-app",
+@@ -59,6 +60,7 @@ gstreamer = [
+ ]
+ pushnoti = [
+   "dep:fcm-push-listener",
++  "dep:reqwest",
+   "dep:dirs",
+   "dep:md5"
+ ]
+diff --git a/src/common/pushnoti.rs b/src/common/pushnoti.rs
+index 4fe9d16..9c89012 100644
+--- a/src/common/pushnoti.rs
++++ b/src/common/pushnoti.rs
+@@ -4,7 +4,9 @@
+ //!
+ 
+ use anyhow::Context;
+-use fcm_push_listener::*;
++use fcm_push_listener::{new_heartbeat_ack, Error as FcmError, Message, MessageStream, Registration};
++use tokio::io::AsyncWriteExt;
++use tokio_stream::StreamExt;
+ use std::collections::{HashMap, HashSet};
+ use std::{fs, sync::Arc};
+ use tokio::{
+@@ -66,13 +68,12 @@ impl PushNotiThread {
+             // Short wait on start/retry
+             sleep(Duration::from_secs(3)).await;
+ 
+-            let sender_id = "743639030586"; // andriod
+-                                            // let sender_id = "696841269229"; // ios
+-
+-            // let firebase_app_id = "1:743639030586:android:86f60a4fb7143876";
+-            // let firebase_project_id = "reolink-login";
+-            // let firebase_api_key = "AIzaSyBEUIuWHnnOEwFahxWgQB4Yt4NsgOmkPyE";
+-            // let vapid_key = "????";
++            // Firebase app of the Reolink Android app. The legacy GCM registration (sender ID
++            // only) stopped working in June 2024; fcm-push-listener 4 registers with Firebase.
++            let firebase_app_id = "1:743639030586:android:86f60a4fb7143876";
++            let firebase_project_id = "reolink-login";
++            let firebase_api_key = "AIzaSyBEUIuWHnnOEwFahxWgQB4Yt4NsgOmkPyE";
++            let http = reqwest::Client::new();
+ 
+             let token_path = dirs::config_dir().map(|mut d| {
+                 fs::create_dir(&d)
+@@ -113,7 +114,15 @@ impl PushNotiThread {
+                 registration
+             } else {
+                 log::debug!("Registering new push notification token");
+-                match fcm_push_listener::register(sender_id).await {
++                match fcm_push_listener::register(
++                    &http,
++                    firebase_app_id,
++                    firebase_project_id,
++                    firebase_api_key,
++                    None,
++                )
++                .await
++                {
+                     Ok(registration) => {
+                         let new_token = toml::to_string(&registration)
+                             .with_context(|| "Unable to serialise fcm token")?;
+@@ -175,41 +184,57 @@ impl PushNotiThread {
+             tokio::select! {
+                 v = async {
+                     loop {
+-                        let mut listener = FcmPushListener::create(
+-                            registration.clone(),
+-                            |message: FcmMessage| {
+-                                log::debug!("Got FCM Message: {:?}", message.payload_json);
+-                                if let Some(id) = message.persistent_id.clone() {
+-                                    // Don't worry if queue is full we will just not register as received yet
+-                                    let _ = sender.try_send(PnRequest::AddPushID { id });
++                        let listen = async {
++                            let session = registration.gcm.checkin(&http).await?;
++                            let ids: Vec<String> = received_ids.read().await.iter().cloned().collect();
++                            let connection = session.new_connection(ids).await?;
++                            let mut stream = MessageStream::wrap(connection, &registration.keys);
++                            log::debug!("Push notification listener connected");
++                            while let Some(message) = stream.next().await {
++                                match message? {
++                                    Message::Data(data) => {
++                                        let payload = String::from_utf8_lossy(&data.body).to_string();
++                                        log::debug!("Got FCM Message: {:?}", payload);
++                                        if let Some(id) = data.persistent_id.clone() {
++                                            // Don't worry if queue is full we will just not register as received yet
++                                            let _ = sender.try_send(PnRequest::AddPushID { id });
++                                        }
++                                        thread_pn_watcher.send_replace(Some(PushNoti {
++                                            message: payload,
++                                            id: data.persistent_id,
++                                        }));
++                                    }
++                                    Message::HeartbeatPing => {
++                                        // Without acks Google stops delivering after about an hour
++                                        stream
++                                            .write_all(&new_heartbeat_ack())
++                                            .await
++                                            .map_err(FcmError::Socket)?;
++                                    }
++                                    Message::Other(..) => {}
+                                 }
+-                                thread_pn_watcher.send_replace(Some(PushNoti {
+-                                    message: message.payload_json,
+-                                    id: message.persistent_id,
+-                                }));
+-                            },
+-                            received_ids.read().await.iter().cloned().collect(),
+-                        );
+-                        let r = timeout(Duration::from_secs(60*5), listener.connect()).await;
++                            }
++                            Ok::<(), FcmError>(())
++                        };
++                        let r = timeout(Duration::from_secs(60*5), listen).await;
+                         match &r {
+                             Ok(Ok(_)) => {
+                                 log::debug!("Push notification listener reported normal shutdown");
+                             }
+                             Ok(Err(e)) => {
+-                                use fcm_push_listener::Error::*;
+                                 match &e {
+-                                    MissingMessagePayload | MissingCryptoMetadata | ProtobufDecode(_) | Base64Decode(_) => {
++                                    FcmError::MissingCryptoMetadata(_) | FcmError::ProtobufDecode(..) | FcmError::Base64Decode(..) | FcmError::Crypto(..) | FcmError::DependencyRejection(..) => {
+                                         // Wipe data so next call is a new token
+                                         token_path.map(|token_path|
+                                             fs::write(token_path, "")
+                                         );
+-                                        log::debug!("Error on push notification listener: {:?}. Clearing token", e);
++                                        log::warn!("Error on push notification listener: {e}. Clearing token");
+                                     },
+-                                    Http(e) if e.is_request() || e.is_connect() || e.is_timeout() => {
+-                                        log::debug!("Error on push notification listener: {:?}", e);
++                                    FcmError::Request(..) | FcmError::Socket(_) => {
++                                        log::debug!("Error on push notification listener: {e}");
+                                     }
+                                     _ => {
+-                                        log::debug!("Error on push notification listener: {:?}", e);
++                                        log::debug!("Error on push notification listener: {e}");
+                                         // This sort of error can be a network error
+                                         // Wait for a little longer
+                                         sleep(Duration::from_secs(30)).await;
+@@ -217,7 +242,7 @@ impl PushNotiThread {
+                                 }
+                             },
+                             Err(_) => {
+-                                // timeout
++                                // Reconnect every 5 minutes; missed messages are redelivered
+                                 continue;
+                             }
+                         };
+diff --git a/src/config.rs b/src/config.rs
+index 341fd9f..7d9d4a6 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -79,6 +79,9 @@ pub(crate) struct WebsocketConfig {
+     /// While the camera is connected anyway, refresh its snapshot when older than this (s); 0 disables
+     #[serde(default = "default_ws_snapshot_refresh")]
+     pub(crate) snapshot_refresh: u64,
++    /// How long (s) `motion` stays on after a push notification (cameras with `push_notifications`)
++    #[serde(default = "default_ws_motion_timeout")]
++    pub(crate) motion_timeout: u64,
+ }
+ 
+ impl Default for WebsocketConfig {
+@@ -91,6 +94,7 @@ impl Default for WebsocketConfig {
+             enable_motion: false,
+             snapshot_dir: None,
+             snapshot_refresh: default_ws_snapshot_refresh(),
++            motion_timeout: default_ws_motion_timeout(),
+         }
+     }
+ }
+@@ -103,6 +107,10 @@ fn default_ws_port() -> u16 {
+     3002
+ }
+ 
++fn default_ws_motion_timeout() -> u64 {
++    30
++}
++
+ fn default_ws_snapshot_refresh() -> u64 {
+     60
+ }
+diff --git a/src/ws/mod.rs b/src/ws/mod.rs
+index 90f1c49..1457ec8 100644
+--- a/src/ws/mod.rs
++++ b/src/ws/mod.rs
+@@ -11,6 +11,8 @@
+ //!
+ //! Battery cameras: background reads use passive tasks, so they never wake a camera that
+ //! disconnected for inactivity (`idle_disconnect`). Only explicit commands and snapshots do.
++//! Motion of battery cameras comes from Reolink push notifications (`push_notifications`): each
++//! one sets `motion` for `motion_timeout` seconds, even while the camera sleeps.
+ //! The cached snapshot is refreshed passively while the camera is connected anyway (live view,
+ //! commands) and kept in `snapshot_dir` across restarts.
+ //!
+@@ -84,6 +86,10 @@ struct CameraState {
+     pir: Option<bool>,
+     motion: Option<bool>,
+     motion_enabled: bool,
++    /// Unix time (s) of the last motion push notification
++    last_motion: Option<u64>,
++    /// Unix time (s) of the cached snapshot
++    snapshot_at: Option<u64>,
+     /// Unix time (s) of the last change
+     updated: u64,
+ }
+@@ -187,21 +193,26 @@ async fn watch_cameras(
+ ) -> AnyResult<()> {
+     let mut running: HashMap<String, CancellationToken> = HashMap::new();
+     loop {
+-        let cams: Vec<(String, Option<String>)> = config
++        let cams: Vec<(String, Option<String>, bool)> = config
+             .borrow()
+             .cameras
+             .iter()
+             .filter(|c| c.enabled)
+-            .map(|c| (c.name.clone(), c.camera_uid.clone()))
++            .map(|c| (c.name.clone(), c.camera_uid.clone(), c.push_notifications))
+             .collect();
+-        let names: HashSet<String> = cams.iter().map(|(name, _)| name.clone()).collect();
+-        for (name, uid) in cams {
++        let names: HashSet<String> = cams.iter().map(|(name, _, _)| name.clone()).collect();
++        for (name, uid, push) in cams {
+             if running.contains_key(&name) {
+                 continue;
+             }
++            let snapshot_at = app.snapshots.read().await.get(&name).map(|(t, _)| *t);
+             update(&app, &name, |s| {
++                s.snapshot_at = snapshot_at;
+                 s.uid = uid.clone();
+-                s.motion_enabled = ws.enable_motion;
++                s.motion_enabled = ws.enable_motion || push;
++                if s.motion_enabled && s.motion.is_none() {
++                    s.motion = Some(false);
++                }
+             })
+             .await;
+             let token = cancel.child_token();
+@@ -265,6 +276,39 @@ async fn watch_camera(app: App, name: &str, ws: &WebsocketConfig) -> AnyResult<(
+         });
+     }
+ 
++    #[cfg(feature = "pushnoti")]
++    if camera.config().await?.borrow().push_notifications {
++        let (app, camera, name) = (app.clone(), camera.clone(), name.to_string());
++        let hold = Duration::from_secs(ws.motion_timeout);
++        set.spawn(async move {
++            // Only notifications for this camera's UID arrive here
++            let mut pn: WatchReceiver<Option<crate::common::PushNoti>> =
++                camera.push_notifications().await?;
++            pn.borrow_and_update();
++            loop {
++                pn.changed().await?;
++                log_push(&name, &pn.borrow_and_update());
++                update(&app, &name, |s| {
++                    s.motion = Some(true);
++                    s.last_motion = Some(now());
++                })
++                .await;
++                // Each further notification restarts the countdown
++                loop {
++                    tokio::select! {
++                        _ = sleep(hold) => break,
++                        v = pn.changed() => {
++                            v?;
++                            log_push(&name, &pn.borrow_and_update());
++                            update(&app, &name, |s| s.last_motion = Some(now())).await;
++                        }
++                    }
++                }
++                update(&app, &name, |s| s.motion = Some(false)).await;
++            }
++        });
++    }
++
+     if ws.enable_motion {
+         let (app, camera, name) = (app.clone(), camera.clone(), name.to_string());
+         set.spawn(async move {
+@@ -312,6 +356,14 @@ async fn watch_camera(app: App, name: &str, ws: &WebsocketConfig) -> AnyResult<(
+     Ok(())
+ }
+ 
++#[cfg(feature = "pushnoti")]
++fn log_push(name: &str, noti: &Option<crate::common::PushNoti>) {
++    log::info!("{name}: push notification (motion)");
++    if let Some(noti) = noti {
++        log::debug!("{name}: push payload: {}", noti.message);
++    }
++}
++
+ /// Runs a camera task; `active` wakes and connects the camera, passive waits for a connection
+ async fn read<T, F>(camera: &NeoInstance, active: bool, task: F) -> AnyResult<T>
+ where
+@@ -465,10 +517,12 @@ async fn take_snapshot(app: &App, name: &str, active: bool) -> AnyResult<Vec<u8>
+         Box::pin(async move { AnyResult::Ok(c.get_snapshot().await?) })
+     })
+     .await?;
++    let taken = now();
+     app.snapshots
+         .write()
+         .await
+-        .insert(name.to_string(), (now(), jpeg.clone()));
++        .insert(name.to_string(), (taken, jpeg.clone()));
++    update(app, name, |s| s.snapshot_at = Some(taken)).await;
+     if let Some(dir) = &app.snapshot_dir {
+         let path = dir.join(format!("{name}.jpg"));
+         if let Err(e) = tokio::fs::write(&path, &jpeg).await {
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,253 @@
+From 3b9c4ac64b44932461d3e3fda80fae62ea1fa6d6 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Witold=20Gre=C5=84?= <witold.gren@gmail.com>
+Date: Sat, 17 Oct 2026 16:25:12 +0200
+Subject: [PATCH 3/7] ws: cached-only snapshots, passive refresh while
+ connected, snapshot_dir
+
+?cached=true serves the cached JPEG (404 if none) and never wakes the
+camera. While the camera is connected anyway, the snapshot is refreshed
+passively when older than snapshot_refresh (s, default 60), and saved to
+snapshot_dir so it survives restarts.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/config.rs | 12 +++++++
+ src/ws/mod.rs | 99 ++++++++++++++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 103 insertions(+), 8 deletions(-)
+
+diff --git a/src/config.rs b/src/config.rs
+index e582c72..341fd9f 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -73,6 +73,12 @@ pub(crate) struct WebsocketConfig {
+     /// Listen for motion events (keeps a passive listener on the camera connection)
+     #[serde(default)]
+     pub(crate) enable_motion: bool,
++    /// Directory where the last snapshot of each camera is kept across restarts
++    #[serde(default)]
++    pub(crate) snapshot_dir: Option<String>,
++    /// While the camera is connected anyway, refresh its snapshot when older than this (s); 0 disables
++    #[serde(default = "default_ws_snapshot_refresh")]
++    pub(crate) snapshot_refresh: u64,
+ }
+ 
+ impl Default for WebsocketConfig {
+@@ -83,6 +89,8 @@ impl Default for WebsocketConfig {
+             token: None,
+             battery_update: default_ws_battery_update(),
+             enable_motion: false,
++            snapshot_dir: None,
++            snapshot_refresh: default_ws_snapshot_refresh(),
+         }
+     }
+ }
+@@ -95,6 +103,10 @@ fn default_ws_port() -> u16 {
+     3002
+ }
+ 
++fn default_ws_snapshot_refresh() -> u64 {
++    60
++}
++
+ fn default_ws_battery_update() -> u64 {
+     1_800_000
+ }
+diff --git a/src/ws/mod.rs b/src/ws/mod.rs
+index 5e50400..90f1c49 100644
+--- a/src/ws/mod.rs
++++ b/src/ws/mod.rs
+@@ -5,11 +5,14 @@
+ //! - `GET /ws` – WebSocket: a `hello` with every camera's state on connect, then
+ //!   request/response commands (`{"id": 1, "command": "led", "camera": "G330", "args": {"on": true}}`)
+ //!   and pushed `state` events whenever a camera's state changes
+-//! - `GET /snapshot/{camera}` – a JPEG still (`?max_age=<s>` serves a cached one if fresh enough)
++//! - `GET /snapshot/{camera}` – a JPEG still (`?max_age=<s>` serves a cached one if fresh enough,
++//!   `?cached=true` serves only the cached one and never wakes the camera, 404 if there is none)
+ //! - `GET /healthz` – liveness and which cameras are connected
+ //!
+ //! Battery cameras: background reads use passive tasks, so they never wake a camera that
+ //! disconnected for inactivity (`idle_disconnect`). Only explicit commands and snapshots do.
++//! The cached snapshot is refreshed passively while the camera is connected anyway (live view,
++//! commands) and kept in `snapshot_dir` across restarts.
+ //!
+ //! Optional authentication: `token` in `[websocket]`, sent as `Authorization: Bearer <token>`
+ //! or `?token=<token>`.
+@@ -36,6 +39,7 @@ use serde_json::{json, Value};
+ use std::{
+     collections::{HashMap, HashSet},
+     future::Future,
++    path::PathBuf,
+     pin::Pin,
+     sync::Arc,
+     time::{SystemTime, UNIX_EPOCH},
+@@ -89,6 +93,7 @@ struct Shared {
+     token: Option<String>,
+     states: RwLock<HashMap<String, CameraState>>,
+     snapshots: RwLock<HashMap<String, (u64, Vec<u8>)>>,
++    snapshot_dir: Option<PathBuf>,
+     events: broadcast::Sender<String>,
+ }
+ 
+@@ -111,7 +116,8 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
+         reactor,
+         token: ws_config.token.clone().filter(|t| !t.is_empty()),
+         states: Default::default(),
+-        snapshots: Default::default(),
++        snapshots: RwLock::new(load_snapshots(ws_config.snapshot_dir.as_deref())),
++        snapshot_dir: ws_config.snapshot_dir.as_ref().map(PathBuf::from),
+         events,
+     });
+ 
+@@ -277,18 +283,24 @@ async fn watch_camera(app: App, name: &str, ws: &WebsocketConfig) -> AnyResult<(
+ 
+     {
+         let (app, camera, name) = (app.clone(), camera.clone(), name.to_string());
++        let snapshot_every = Duration::from_secs(ws.snapshot_refresh);
+         set.spawn(async move {
+             let mut watch = camera.camera();
+             loop {
+                 watch.wait_for(|c| c.upgrade().is_some()).await?;
+                 update(&app, &name, |s| s.connected = true).await;
+                 // Fill in model, firmware, LED/IR/PIR and battery while the link is up anyway
+-                let refresh = refresh(&app, &name, &camera, false);
++                let refresh = async {
++                    refresh(&app, &name, &camera, false).await;
++                    if snapshot_every.is_zero() {
++                        std::future::pending::<()>().await;
++                    }
++                    refresh_snapshots(&app, &name, snapshot_every).await;
++                };
+                 tokio::select! {
+                     _ = refresh => {},
+                     v = watch.wait_for(|c| c.upgrade().is_none()) => { v?; }
+                 }
+-                watch.wait_for(|c| c.upgrade().is_none()).await?;
+                 update(&app, &name, |s| s.connected = false).await;
+             }
+         });
+@@ -387,6 +399,7 @@ async fn refresh(app: &App, name: &str, camera: &NeoInstance, active: bool) {
+ struct AuthQuery {
+     token: Option<String>,
+     max_age: Option<u64>,
++    cached: Option<bool>,
+ }
+ 
+ fn authorized(app: &App, headers: &HeaderMap, query: &AuthQuery) -> bool {
+@@ -426,6 +439,12 @@ async fn snapshot(
+     if !app.states.read().await.contains_key(&name) {
+         return (StatusCode::NOT_FOUND, format!("unknown camera `{name}`")).into_response();
+     }
++    if query.cached == Some(true) {
++        return match app.snapshots.read().await.get(&name) {
++            Some((_, jpeg)) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg.clone()).into_response(),
++            None => (StatusCode::NOT_FOUND, "no cached snapshot").into_response(),
++        };
++    }
+     if let Some(max_age) = query.max_age {
+         if let Some((taken, jpeg)) = app.snapshots.read().await.get(&name) {
+             if now().saturating_sub(*taken) <= max_age {
+@@ -433,15 +452,16 @@ async fn snapshot(
+             }
+         }
+     }
+-    match take_snapshot(&app, &name).await {
++    match take_snapshot(&app, &name, true).await {
+         Ok(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
+         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")).into_response(),
+     }
+ }
+ 
+-async fn take_snapshot(app: &App, name: &str) -> AnyResult<Vec<u8>> {
++/// Takes a snapshot (`active` wakes the camera), caches it and saves it to `snapshot_dir`
++async fn take_snapshot(app: &App, name: &str, active: bool) -> AnyResult<Vec<u8>> {
+     let camera = app.reactor.get(name).await?;
+-    let jpeg = read(&camera, true, |c| {
++    let jpeg = read(&camera, active, |c| {
+         Box::pin(async move { AnyResult::Ok(c.get_snapshot().await?) })
+     })
+     .await?;
+@@ -449,9 +469,72 @@ async fn take_snapshot(app: &App, name: &str) -> AnyResult<Vec<u8>> {
+         .write()
+         .await
+         .insert(name.to_string(), (now(), jpeg.clone()));
++    if let Some(dir) = &app.snapshot_dir {
++        let path = dir.join(format!("{name}.jpg"));
++        if let Err(e) = tokio::fs::write(&path, &jpeg).await {
++            log::warn!("{name}: cannot save snapshot to {}: {e}", path.display());
++        }
++    }
++    log::debug!("{name}: snapshot taken ({} bytes, active: {active})", jpeg.len());
+     Ok(jpeg)
+ }
+ 
++/// Reads `<dir>/<camera>.jpg` files saved by earlier runs; the file time is the snapshot time
++fn load_snapshots(dir: Option<&str>) -> HashMap<String, (u64, Vec<u8>)> {
++    let mut snapshots = HashMap::new();
++    let Some(dir) = dir else {
++        return snapshots;
++    };
++    if let Err(e) = std::fs::create_dir_all(dir) {
++        log::warn!("Cannot create snapshot directory {dir}: {e}");
++        return snapshots;
++    }
++    let Ok(entries) = std::fs::read_dir(dir) else {
++        return snapshots;
++    };
++    for entry in entries.flatten() {
++        let path = entry.path();
++        if path.extension().and_then(|e| e.to_str()) != Some("jpg") {
++            continue;
++        }
++        let (Some(name), Ok(jpeg)) = (
++            path.file_stem().and_then(|n| n.to_str()),
++            std::fs::read(&path),
++        ) else {
++            continue;
++        };
++        let taken = entry
++            .metadata()
++            .and_then(|m| m.modified())
++            .ok()
++            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
++            .map(|d| d.as_secs())
++            .unwrap_or_default();
++        snapshots.insert(name.to_string(), (taken, jpeg));
++    }
++    snapshots
++}
++
++/// While connected, refreshes the cached snapshot whenever it is older than `every`
++async fn refresh_snapshots(app: &App, name: &str, every: Duration) {
++    // Let the camera finish waking up (stream start, state reads) first
++    sleep(Duration::from_secs(5)).await;
++    loop {
++        let age = app
++            .snapshots
++            .read()
++            .await
++            .get(name)
++            .map(|(taken, _)| now().saturating_sub(*taken));
++        if age.map(|a| a >= every.as_secs()).unwrap_or(true) {
++            if let Err(e) = take_snapshot(app, name, false).await {
++                log::debug!("{name}: passive snapshot failed: {e:#}");
++            }
++        }
++        sleep(every).await;
++    }
++}
++
+ async fn ws_handler(
+     State(app): State<App>,
+     headers: HeaderMap,
+@@ -608,7 +691,7 @@ async fn command(app: &App, request: &Request) -> AnyResult<Value> {
+         }
+         "refresh" => refresh(app, name, &camera, true).await,
+         "snapshot" => {
+-            let jpeg = take_snapshot(app, name).await?;
++            let jpeg = take_snapshot(app, name, true).await?;
+             return Ok(json!({"jpeg": BASE64.encode(jpeg)}));
+         }
+         "wakeup" => {
+-- 
+2.54.0 (Apple Git-157)
+

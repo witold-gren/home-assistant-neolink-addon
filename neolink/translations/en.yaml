@@ -1,0 +1,24 @@
+configuration:
+  log_level:
+    name: Log level
+    description: How much detail to log. debug shows e.g. the content of every Reolink push notification (the "push payload:" line) - for diagnostics, then go back to info.
+  battery_minutes:
+    name: Battery read (min)
+    description: How often to read the battery while the camera is connected anyway (never wakes it). 0 = off.
+  motion:
+    name: Motion listening
+    description: Motion events while the camera is connected. Costs battery and data on LTE.
+  push:
+    name: Motion from push notifications
+    description: The camera reports motion (PIR) through Reolink push notifications. Works while the camera sleeps; Neolink then connects to it for 30 s.
+  motion_seconds:
+    name: Motion hold time (s)
+    description: How long the motion sensor stays on after a notification. A further notification restarts the countdown.
+  cameras:
+    name: Cameras
+    description: >-
+      name, uid (16 chars, starts with 9527), username, device password, discovery (cellular for
+      LTE), stream, idle_disconnect.
+network:
+  8554/tcp: RTSP (camera video, password protected)
+  3002/tcp: WebSocket API (HA network only by default)

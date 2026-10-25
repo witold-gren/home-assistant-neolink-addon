@@ -1,0 +1,192 @@
+From 5ddd503c971e9f3ee04a5c9c4ce36a1b434a2d78 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Witold=20Gre=C5=84?= <witold.gren@gmail.com>
+Date: Sat, 17 Oct 2026 18:20:05 +0200
+Subject: [PATCH 5/7] rtsp: never let a dead client keep a battery camera awake
+
+A stream task holds a use permit while it forwards frames, so anything
+that stalls it keeps the camera connected. Seen on a Reolink Go Plus: the
+camera stayed online for 30 minutes after a live view ended.
+
+- send_to_appsrc: allocate a buffer per frame instead of the 32-buffer
+  pool whose acquire_buffer(None) blocked forever once a stalled pipeline
+  stopped releasing buffers (upstream #340)
+- a flushing or not-playing appsrc ends the stream after 15 s instead of
+  silently skipping frames forever
+- the camera stream task gives up when its consumer has not taken a
+  frame for 15 s
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/common/instance/gst.rs |  9 ++++-
+ src/rtsp/factory.rs        | 78 ++++++++++++++++++++------------------
+ 2 files changed, 50 insertions(+), 37 deletions(-)
+
+diff --git a/src/common/instance/gst.rs b/src/common/instance/gst.rs
+index 7dccd3b..c03beb6 100644
+--- a/src/common/instance/gst.rs
++++ b/src/common/instance/gst.rs
+@@ -189,7 +189,14 @@ impl NeoInstance {
+                             let mut media_stream = cam.start_video(stream, 0, strict).await?;
+                             log::trace!("Camera started");
+                             while let Ok(media) = media_stream.get_data().await? {
+-                                media_tx.send(media).await?;
++                                // A consumer that stopped reading must not keep the camera
++                                // awake: this task holds a use permit while it runs.
++                                tokio::time::timeout(
++                                    tokio::time::Duration::from_secs(15),
++                                    media_tx.send(media),
++                                )
++                                .await
++                                .map_err(|_| anyhow!("Stream consumer stalled for 15s"))??;
+                             }
+                             AnyResult::Ok(())
+                         })
+diff --git a/src/rtsp/factory.rs b/src/rtsp/factory.rs
+index 9ba058e..dd26da8 100644
+--- a/src/rtsp/factory.rs
++++ b/src/rtsp/factory.rs
+@@ -1,5 +1,5 @@
+ use gstreamer::ClockTime;
+-use std::{collections::HashMap, time::Duration};
++use std::time::{Duration, Instant};
+ 
+ use anyhow::{anyhow, Context, Result};
+ use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory, FlowError, GhostPad};
+@@ -245,7 +245,7 @@ pub(super) async fn make_factory(
+                         std::thread::spawn(move || {
+                             let mut aud_ts = 0u32;
+                             let mut vid_ts = 0u32;
+-                            let mut pools = Default::default();
++                            let mut pools = SendState::default();
+ 
+                             log::trace!("{name}::{stream}: Sending buffered frames");
+                             for buffered in buffer.drain(..) {
+@@ -299,9 +299,20 @@ pub(super) async fn make_factory(
+     Ok((factory, thread))
+ }
+ 
++/// How long an appsrc may refuse buffers as flushing before the stream is dropped. A client
++/// that left without a TEARDOWN leaves its pipeline flushing forever, and a stream that keeps
++/// running for nobody holds the camera awake (and drains a battery camera).
++const FLUSHING_LIMIT: Duration = Duration::from_secs(15);
++
++/// Per-client sending state
++#[derive(Default)]
++struct SendState {
++    flushing_since: Option<Instant>,
++}
++
+ fn send_to_sources(
+     data: BcMedia,
+-    pools: &mut HashMap<usize, gstreamer::BufferPool>,
++    pools: &mut SendState,
+     vid_src: &Option<AppSrc>,
+     aud_src: &Option<AppSrc>,
+     vid_ts: &mut u32,
+@@ -356,7 +367,7 @@ fn send_to_appsrc(
+     appsrc: &AppSrc,
+     data: Vec<u8>,
+     mut ts: Duration,
+-    pools: &mut HashMap<usize, gstreamer::BufferPool>,
++    state: &mut SendState,
+ ) -> AnyResult<()> {
+     check_live(appsrc)?; // Stop if appsrc is dropped
+ 
+@@ -373,47 +384,29 @@ fn send_to_appsrc(
+                 ts = Duration::from_micros(time.useconds());
+             } else {
+                 // Not playing
+-                return Ok(());
++                return not_playing(appsrc, state);
+             }
+         } else {
+             // Clock not up yet
+-            return Ok(());
++            return not_playing(appsrc, state);
+         }
+     }
++    // A fresh buffer per frame. The former fixed-size pool (32 buffers) blocked forever in
++    // acquire_buffer once a stalled pipeline stopped releasing them, which froze this thread
++    // and with it the camera stream (upstream neolink #340).
+     let buf = {
+-        let msg_size = data.len();
+-
+-        // Get or create a pool of this len
+-        let pool = pools.entry(msg_size).or_insert_with_key(|size| {
+-            let pool = gstreamer::BufferPool::new();
+-            let mut pool_config = pool.config();
+-            // Set a max buffers to ensure we don't grow in memory endlessly
+-            pool_config.set_params(None, (*size) as u32, 8, 32);
+-            pool.set_config(pool_config).unwrap();
+-            pool.set_active(true).unwrap();
+-            pool
+-        });
+-
+-        // Get a buffer from the pool and then copy in the data
+-        let gst_buf = {
+-            let mut new_buf = pool.acquire_buffer(None).unwrap();
+-            let gst_buf_mut = new_buf.get_mut().unwrap();
+-            let time = ClockTime::from_useconds(ts.as_micros() as u64);
+-            gst_buf_mut.set_dts(time);
+-            gst_buf_mut.set_pts(time);
+-            let mut gst_buf_data = gst_buf_mut.map_writable().unwrap();
+-            gst_buf_data.copy_from_slice(data.as_slice());
+-            drop(gst_buf_data);
+-            new_buf
+-        };
+-
+-        // Return the new buffer with the data
+-        gst_buf
++        let mut buf = gstreamer::Buffer::from_mut_slice(data);
++        let buf_mut = buf.get_mut().expect("A new buffer is writable");
++        let time = ClockTime::from_useconds(ts.as_micros() as u64);
++        buf_mut.set_dts(time);
++        buf_mut.set_pts(time);
++        buf
+     };
+ 
+     // Push buffer into the appsrc
+     match appsrc.push_buffer(buf) {
+         Ok(_) => {
++            state.flushing_since = None;
+             // log::info!(
+             //     "Send {}{} on {}",
+             //     data.data.len(),
+@@ -423,12 +416,12 @@ fn send_to_appsrc(
+             Ok(())
+         }
+         Err(FlowError::Flushing) => {
+-            // Buffer is full just skip
++            // Not playing (yet): skip the frame, but not forever
+             log::info!(
+                 "Buffer full on {} pausing stream until client consumes frames",
+                 appsrc.name()
+             );
+-            Ok(())
++            not_playing(appsrc, state)
+         }
+         Err(e) => Err(anyhow!("Error in streaming: {e:?}")),
+     }?;
+@@ -444,6 +437,19 @@ fn send_to_appsrc(
+     }
+     Ok(())
+ }
++/// Skips a frame while the appsrc cannot take it, until FLUSHING_LIMIT
++fn not_playing(appsrc: &AppSrc, state: &mut SendState) -> AnyResult<()> {
++    let since = *state.flushing_since.get_or_insert_with(Instant::now);
++    if since.elapsed() > FLUSHING_LIMIT {
++        Err(anyhow!(
++            "App source {} not playing for {FLUSHING_LIMIT:?}, client is gone",
++            appsrc.name()
++        ))
++    } else {
++        Ok(())
++    }
++}
++
+ fn check_live(app: &AppSrc) -> Result<()> {
+     app.bus().ok_or(anyhow!("App source is closed"))?;
+     app.pads()
+-- 
+2.54.0 (Apple Git-157)
+

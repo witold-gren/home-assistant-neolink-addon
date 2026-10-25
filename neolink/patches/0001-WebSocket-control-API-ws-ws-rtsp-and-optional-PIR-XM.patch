@@ -1,0 +1,920 @@
+From 943b6ed0ddb8463fc7af8f0e678170d478829ce9 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Witold=20Gre=C5=84?= <witold.gren@gmail.com>
+Date: Sat, 17 Oct 2026 13:54:03 +0200
+Subject: [PATCH 1/7] WebSocket control API (ws, ws-rtsp) and optional PIR XML
+ fields
+
+- new [websocket] config and ws / ws-rtsp commands: GET /ws (hello, commands,
+  state events), GET /snapshot/{camera} (JPEG, ?max_age cache), GET /healthz,
+  optional bearer token; background reads are passive so idle battery
+  cameras are never woken
+- RfAlarmCfg: rfID, sensitivity, timeBlockList and alarmHandle are optional;
+  Reolink Go Plus omits them and the parse error dropped the connection
+
+Tested with Reolink Go Plus (G330) over 4G relay.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .gitignore                |   1 +
+ Cargo.lock                | Bin 94062 -> 100914 bytes
+ Cargo.toml                |   1 +
+ crates/core/src/bc/xml.rs |  23 +-
+ src/cmdline.rs            |   3 +
+ src/config.rs             |  48 +++
+ src/main.rs               |  11 +
+ src/ws/cmdline.rs         |   5 +
+ src/ws/mod.rs             | 633 ++++++++++++++++++++++++++++++++++++++
+ 9 files changed, 714 insertions(+), 11 deletions(-)
+ create mode 100644 src/ws/cmdline.rs
+ create mode 100644 src/ws/mod.rs
+
+diff --git a/.gitignore b/.gitignore
+index 9443b4e..42dc54c 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -28,3 +28,4 @@ token.toml
+ 
+ # Debug FCM build
+ crates/fcm-push-listener
++/dist-*
+diff --git a/Cargo.lock b/Cargo.lock
+index c0e32a35d933940cfc295bb734e8ea144b0bf1be..f5255fd726c705812e1c03fdc016ac65c2743926 100644
+GIT binary patch
+delta 3898
+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
+OqpQ)?myT7>k^ca_(vHjk
+
+delta 660
+zcmY*WJxJ710OwtL+*uwdad#TkDK=zk@B6*~(m_@v6)3p4`95jW%Eh6gprN3pr#vyG
+zLTC%DKlI0fu!bV2r517MW2hxCu}OsJpq9oTKlpt<naOW_YF?h}Oyj<xTza7URW5u8
+zBXug6<lH-hC_~yYu86@DLT{l&-ZRP>kqJkPGh;N<0#R(V#aJ7m7z&Sj_NTWG*;<;N
+z+BzP<S~-1vbEg;{&bEhlzeYoG*2Jz8pc)ojC4C-;c9pvOT58?rr=}+R^@N=c2k*{@
+z-o>|JXYq9SeZQ1Gz4xG+mRE{}R;?~MPHS)g;{lkmmra$hF`7^1`qFM7W7h>RTxU+8
+z#7XNpXVycDjP%-DOe921P%20xII@&d<_wgCYw0+aN;w3H7V#PZ<uJZfNN;@~X|MjD
+z>@S+0bQeQm`(yfbd%cuhErQGW97;l0&+swgb;C~(hjgN0V>oIJHPE0$YD^9BUO|>%
+zN~B<nVU4wg2_YIO=coy*6O}mM1_uAh)rHeg6RIh8)*#`z7DgFK6~hV{=3&D}V~mAM
+zk_MANgq$MQ66z#JFtlAShb!MY!)M+TSKB~7zG(+r*|WW%-jx090CS~yvKN$NNrKV%
+z<1iSDNBco@gnghj>pTL!l(UvWaHlzLp8*|_)WArcYlBQ;9M%jGri}0jF#;z@dP9VF
+zT8c&`!xdwMD5)iLnrg`#2PnsI0J%zBISXEd&9yyYbD@~coCEJcwmb}~h3v){cm)3d
+DZ${Uc
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 218de72..82c6342 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -13,6 +13,7 @@ members = [
+ 
+ [dependencies]
+ anyhow = "1.0.70"
++axum = { version = "0.7.9", features = ["ws"] }
+ base64 = "0.22.0"
+ byte-slice-cast = {version = "1.2.2", optional = true}
+ bytes = "1.6.0"
+diff --git a/crates/core/src/bc/xml.rs b/crates/core/src/bc/xml.rs
+index 16048f5..3986ae0 100644
+--- a/crates/core/src/bc/xml.rs
++++ b/crates/core/src/bc/xml.rs
+@@ -465,23 +465,24 @@ pub struct RfAlarmCfg {
+     /// XML Version
+     #[serde(rename = "@version")]
+     pub version: String,
+-    /// Rfid
+-    #[serde(rename = "rfID")]
+-    pub rf_id: u8,
++    /// Rfid (absent on some battery cameras, e.g. Reolink Go Plus)
++    #[serde(rename = "rfID", default, skip_serializing_if = "Option::is_none")]
++    pub rf_id: Option<u8>,
+     /// PIR status
+     pub enable: u8,
+-    /// PIR sensitivity
+-    pub sensitivity: u8,
++    /// PIR sensitivity (absent on some battery cameras)
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub sensitivity: Option<u8>,
+     /// PIR sensivalue
+     pub sensiValue: u8,
+     /// reduce False alarm boolean
+     pub reduceFalseAlarm: u8,
+-    /// XML time block for all week days
+-    #[serde(rename = "timeBlockList")]
+-    pub time_block_list: TimeBlockList,
+-    /// The alarm handle to attach to this Rf
+-    #[serde(rename = "alarmHandle")]
+-    pub alarm_handle: AlarmHandle,
++    /// XML time block for all week days (absent on some battery cameras)
++    #[serde(rename = "timeBlockList", default, skip_serializing_if = "Option::is_none")]
++    pub time_block_list: Option<TimeBlockList>,
++    /// The alarm handle to attach to this Rf (absent on some battery cameras)
++    #[serde(rename = "alarmHandle", default, skip_serializing_if = "Option::is_none")]
++    pub alarm_handle: Option<AlarmHandle>,
+ }
+ 
+ /// TimeBlockList XML
+diff --git a/src/cmdline.rs b/src/cmdline.rs
+index 693c5b4..536dac0 100644
+--- a/src/cmdline.rs
++++ b/src/cmdline.rs
+@@ -28,6 +28,9 @@ pub enum Command {
+     Mqtt(super::mqtt::Opt),
+     #[cfg(feature = "gstreamer")]
+     MqttRtsp(super::mqtt::Opt),
++    Ws(super::ws::Opt),
++    #[cfg(feature = "gstreamer")]
++    WsRtsp(super::ws::Opt),
+     #[cfg(feature = "gstreamer")]
+     Image(super::image::Opt),
+     Battery(super::battery::Opt),
+diff --git a/src/config.rs b/src/config.rs
+index 6ca22ad..e582c72 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -38,6 +38,10 @@ pub(crate) struct Config {
+     #[serde(default = "Default::default")]
+     pub(crate) mqtt: Option<MqttServerConfig>,
+ 
++    /// WebSocket control API (`ws` and `ws-rtsp` commands)
++    #[serde(default = "Default::default")]
++    pub(crate) websocket: Option<WebsocketConfig>,
++
+     #[validate(regex(
+         path = *RE_TLS_CLIENT_AUTH,
+         message = "Incorrect tls auth",
+@@ -51,6 +55,50 @@ pub(crate) struct Config {
+     pub(crate) users: Vec<UserConfig>,
+ }
+ 
++/// Settings of the WebSocket control API
++#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
++pub(crate) struct WebsocketConfig {
++    /// Address the HTTP/WebSocket server binds to
++    #[serde(default = "default_ws_bind")]
++    pub(crate) bind: String,
++    /// Port of the HTTP/WebSocket server
++    #[serde(default = "default_ws_port")]
++    pub(crate) port: u16,
++    /// Optional bearer token required from clients (header or `?token=`)
++    #[serde(default, skip_serializing)]
++    pub(crate) token: Option<String>,
++    /// How often (ms) the battery is read while the camera is connected anyway; 0 disables
++    #[serde(default = "default_ws_battery_update")]
++    pub(crate) battery_update: u64,
++    /// Listen for motion events (keeps a passive listener on the camera connection)
++    #[serde(default)]
++    pub(crate) enable_motion: bool,
++}
++
++impl Default for WebsocketConfig {
++    fn default() -> Self {
++        Self {
++            bind: default_ws_bind(),
++            port: default_ws_port(),
++            token: None,
++            battery_update: default_ws_battery_update(),
++            enable_motion: false,
++        }
++    }
++}
++
++fn default_ws_bind() -> String {
++    "0.0.0.0".to_string()
++}
++
++fn default_ws_port() -> u16 {
++    3002
++}
++
++fn default_ws_battery_update() -> u64 {
++    1_800_000
++}
++
+ #[derive(Debug, Deserialize, Serialize, Clone, Validate, PartialEq, Eq)]
+ #[validate(schema(function = "validate_mqtt_server", skip_on_field_errors = true))]
+ pub(crate) struct MqttServerConfig {
+diff --git a/src/main.rs b/src/main.rs
+index e143d05..a4febf6 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -54,6 +54,7 @@ mod statusled;
+ mod talk;
+ mod users;
+ mod utils;
++mod ws;
+ 
+ use cmdline::{Command, Opt};
+ use common::NeoReactor;
+@@ -134,6 +135,16 @@ async fn main() -> Result<()> {
+                 v = rtsp::main(rtsp::Opt {}, neo_reactor.clone()) => v,
+             }?;
+         }
++        Some(Command::Ws(opts)) => {
++            ws::main(opts, neo_reactor.clone()).await?;
++        }
++        #[cfg(feature = "gstreamer")]
++        Some(Command::WsRtsp(opts)) => {
++            tokio::select! {
++                v = ws::main(opts, neo_reactor.clone()) => v,
++                v = rtsp::main(rtsp::Opt {}, neo_reactor.clone()) => v,
++            }?;
++        }
+         #[cfg(feature = "gstreamer")]
+         Some(Command::Image(opts)) => {
+             image::main(opts, neo_reactor.clone()).await?;
+diff --git a/src/ws/cmdline.rs b/src/ws/cmdline.rs
+new file mode 100644
+index 0000000..77f8b51
+--- /dev/null
++++ b/src/ws/cmdline.rs
+@@ -0,0 +1,5 @@
++use clap::Parser;
++
++/// The ws command serves a WebSocket control API (and, with ws-rtsp, the RTSP streams)
++#[derive(Parser, Debug)]
++pub struct Opt {}
+diff --git a/src/ws/mod.rs b/src/ws/mod.rs
+new file mode 100644
+index 0000000..5e50400
+--- /dev/null
++++ b/src/ws/mod.rs
+@@ -0,0 +1,633 @@
++//! WebSocket control API
++//!
++//! A JSON API for frontends such as a Home Assistant integration, without an MQTT broker:
++//!
++//! - `GET /ws` – WebSocket: a `hello` with every camera's state on connect, then
++//!   request/response commands (`{"id": 1, "command": "led", "camera": "G330", "args": {"on": true}}`)
++//!   and pushed `state` events whenever a camera's state changes
++//! - `GET /snapshot/{camera}` – a JPEG still (`?max_age=<s>` serves a cached one if fresh enough)
++//! - `GET /healthz` – liveness and which cameras are connected
++//!
++//! Battery cameras: background reads use passive tasks, so they never wake a camera that
++//! disconnected for inactivity (`idle_disconnect`). Only explicit commands and snapshots do.
++//!
++//! Optional authentication: `token` in `[websocket]`, sent as `Authorization: Bearer <token>`
++//! or `?token=<token>`.
++use crate::{
++    common::{MdState, NeoInstance, NeoReactor},
++    config::{Config, WebsocketConfig},
++    AnyResult,
++};
++use anyhow::{anyhow, Context, Result};
++use axum::{
++    extract::{
++        ws::{Message, WebSocket, WebSocketUpgrade},
++        Path, Query, State,
++    },
++    http::{header, HeaderMap, StatusCode},
++    response::{IntoResponse, Response},
++    routing::get,
++    Json, Router,
++};
++use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
++use neolink_core::bc_protocol::{BcCamera, LightState};
++use serde::{Deserialize, Serialize};
++use serde_json::{json, Value};
++use std::{
++    collections::{HashMap, HashSet},
++    future::Future,
++    pin::Pin,
++    sync::Arc,
++    time::{SystemTime, UNIX_EPOCH},
++};
++use tokio::{
++    sync::{broadcast, mpsc, watch::Receiver as WatchReceiver, RwLock},
++    task::JoinSet,
++    time::{interval, sleep, timeout, Duration, MissedTickBehavior},
++};
++use tokio_util::sync::CancellationToken;
++
++mod cmdline;
++
++pub(crate) use cmdline::Opt;
++
++/// Longest wait for a camera that has to be woken up over a relay (4G) connection
++const COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
++
++#[derive(Debug, Clone, Default, Serialize)]
++struct BatteryState {
++    percent: u32,
++    charge_status: String,
++    adapter_status: String,
++    voltage: i32,
++    current: i32,
++    temperature: i32,
++    low_power: bool,
++}
++
++#[derive(Debug, Clone, Default, Serialize)]
++struct CameraState {
++    name: String,
++    uid: Option<String>,
++    connected: bool,
++    model: Option<String>,
++    firmware: Option<String>,
++    hardware: Option<String>,
++    serial: Option<String>,
++    battery: Option<BatteryState>,
++    led: Option<bool>,
++    ir: Option<String>,
++    pir: Option<bool>,
++    motion: Option<bool>,
++    motion_enabled: bool,
++    /// Unix time (s) of the last change
++    updated: u64,
++}
++
++struct Shared {
++    reactor: NeoReactor,
++    token: Option<String>,
++    states: RwLock<HashMap<String, CameraState>>,
++    snapshots: RwLock<HashMap<String, (u64, Vec<u8>)>>,
++    events: broadcast::Sender<String>,
++}
++
++type App = Arc<Shared>;
++
++type CameraTask<'a, T> = Pin<Box<dyn Future<Output = AnyResult<T>> + Send + 'a>>;
++
++fn now() -> u64 {
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map(|d| d.as_secs())
++        .unwrap_or_default()
++}
++
++pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
++    let config = reactor.config().await?;
++    let ws_config = config.borrow().websocket.clone().unwrap_or_default();
++    let (events, _) = broadcast::channel(256);
++    let app: App = Arc::new(Shared {
++        reactor,
++        token: ws_config.token.clone().filter(|t| !t.is_empty()),
++        states: Default::default(),
++        snapshots: Default::default(),
++        events,
++    });
++
++    let cancel = CancellationToken::new();
++    let _cancel_drop = cancel.clone().drop_guard();
++    let mut set = JoinSet::<AnyResult<()>>::new();
++    set.spawn(watch_cameras(
++        app.clone(),
++        config.clone(),
++        ws_config.clone(),
++        cancel.clone(),
++    ));
++
++    let router = Router::new()
++        .route("/healthz", get(healthz))
++        .route("/ws", get(ws_handler))
++        .route("/snapshot/:name", get(snapshot))
++        .with_state(app.clone());
++    let addr = format!("{}:{}", ws_config.bind, ws_config.port);
++    let listener = tokio::net::TcpListener::bind(&addr)
++        .await
++        .with_context(|| format!("Failed to bind the WebSocket API to {addr}"))?;
++    log::info!("WebSocket API listening on {addr} (/ws, /snapshot/<camera>, /healthz)");
++    set.spawn(async move {
++        axum::serve(listener, router)
++            .await
++            .with_context(|| "WebSocket API server stopped")
++    });
++
++    while let Some(result) = set.join_next().await {
++        result??;
++    }
++    Ok(())
++}
++
++/// Updates a camera's state and pushes it to every client
++async fn update<F: FnOnce(&mut CameraState)>(app: &App, name: &str, change: F) {
++    let state = {
++        let mut states = app.states.write().await;
++        let state = states
++            .entry(name.to_string())
++            .or_insert_with(|| CameraState {
++                name: name.to_string(),
++                ..Default::default()
++            });
++        change(state);
++        state.updated = now();
++        state.clone()
++    };
++    let _ = app.events.send(
++        json!({"type": "event", "event": "state", "camera": name, "state": state}).to_string(),
++    );
++}
++
++async fn cameras(app: &App) -> Vec<CameraState> {
++    let mut list: Vec<CameraState> = app.states.read().await.values().cloned().collect();
++    list.sort_by(|a, b| a.name.cmp(&b.name));
++    list
++}
++
++/// Starts and stops per-camera watchers as cameras come and go in the config
++async fn watch_cameras(
++    app: App,
++    mut config: WatchReceiver<Config>,
++    ws: WebsocketConfig,
++    cancel: CancellationToken,
++) -> AnyResult<()> {
++    let mut running: HashMap<String, CancellationToken> = HashMap::new();
++    loop {
++        let cams: Vec<(String, Option<String>)> = config
++            .borrow()
++            .cameras
++            .iter()
++            .filter(|c| c.enabled)
++            .map(|c| (c.name.clone(), c.camera_uid.clone()))
++            .collect();
++        let names: HashSet<String> = cams.iter().map(|(name, _)| name.clone()).collect();
++        for (name, uid) in cams {
++            if running.contains_key(&name) {
++                continue;
++            }
++            update(&app, &name, |s| {
++                s.uid = uid.clone();
++                s.motion_enabled = ws.enable_motion;
++            })
++            .await;
++            let token = cancel.child_token();
++            running.insert(name.clone(), token.clone());
++            let app = app.clone();
++            let ws = ws.clone();
++            tokio::spawn(async move {
++                loop {
++                    let result = tokio::select! {
++                        _ = token.cancelled() => break,
++                        v = watch_camera(app.clone(), &name, &ws) => v,
++                    };
++                    if let Err(e) = result {
++                        log::warn!("{name}: WebSocket watcher restarting: {e:#}");
++                    }
++                    sleep(Duration::from_secs(5)).await;
++                }
++            });
++        }
++        running.retain(|name, token| {
++            let keep = names.contains(name);
++            if !keep {
++                token.cancel();
++            }
++            keep
++        });
++        app.states
++            .write()
++            .await
++            .retain(|name, _| names.contains(name));
++        tokio::select! {
++            _ = cancel.cancelled() => return Ok(()),
++            v = config.changed() => v?,
++        }
++    }
++}
++
++/// Follows one camera: connection, battery while connected, motion
++async fn watch_camera(app: App, name: &str, ws: &WebsocketConfig) -> AnyResult<()> {
++    let camera = app.reactor.get(name).await?;
++    let mut set = JoinSet::<AnyResult<()>>::new();
++
++    if ws.battery_update > 0 {
++        let (app, camera, name) = (app.clone(), camera.clone(), name.to_string());
++        let every = Duration::from_millis(ws.battery_update);
++        set.spawn(async move {
++            let mut tick = interval(every);
++            tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
++            loop {
++                tick.tick().await;
++                // Passive: waits for a connection instead of waking the camera
++                match read(&camera, false, |c| {
++                    Box::pin(async move { AnyResult::Ok(c.battery_info().await?) })
++                })
++                .await
++                {
++                    Ok(b) => update(&app, &name, |s| s.battery = Some(battery_state(&b))).await,
++                    Err(e) => log::debug!("{name}: battery read failed: {e:#}"),
++                }
++            }
++        });
++    }
++
++    if ws.enable_motion {
++        let (app, camera, name) = (app.clone(), camera.clone(), name.to_string());
++        set.spawn(async move {
++            let mut md = camera.motion().await?;
++            loop {
++                md.changed().await?;
++                let motion = match &*md.borrow() {
++                    MdState::Start(_) => Some(true),
++                    MdState::Stop(_) => Some(false),
++                    MdState::Unknown => None,
++                };
++                update(&app, &name, |s| s.motion = motion).await;
++            }
++        });
++    }
++
++    {
++        let (app, camera, name) = (app.clone(), camera.clone(), name.to_string());
++        set.spawn(async move {
++            let mut watch = camera.camera();
++            loop {
++                watch.wait_for(|c| c.upgrade().is_some()).await?;
++                update(&app, &name, |s| s.connected = true).await;
++                // Fill in model, firmware, LED/IR/PIR and battery while the link is up anyway
++                let refresh = refresh(&app, &name, &camera, false);
++                tokio::select! {
++                    _ = refresh => {},
++                    v = watch.wait_for(|c| c.upgrade().is_none()) => { v?; }
++                }
++                watch.wait_for(|c| c.upgrade().is_none()).await?;
++                update(&app, &name, |s| s.connected = false).await;
++            }
++        });
++    }
++
++    while let Some(result) = set.join_next().await {
++        result??;
++    }
++    Ok(())
++}
++
++/// Runs a camera task; `active` wakes and connects the camera, passive waits for a connection
++async fn read<T, F>(camera: &NeoInstance, active: bool, task: F) -> AnyResult<T>
++where
++    F: for<'a> Fn(&'a BcCamera) -> CameraTask<'a, T>,
++{
++    if active {
++        timeout(COMMAND_TIMEOUT, camera.run_task(task))
++            .await
++            .map_err(|_| anyhow!("camera did not answer within {COMMAND_TIMEOUT:?}"))?
++    } else {
++        camera.run_passive_task(task).await
++    }
++}
++
++fn battery_state(b: &neolink_core::bc::xml::BatteryInfo) -> BatteryState {
++    BatteryState {
++        percent: b.battery_percent,
++        charge_status: b.charge_status.clone(),
++        adapter_status: b.adapter_status.clone(),
++        voltage: b.voltage,
++        current: b.current,
++        temperature: b.temperature,
++        low_power: b.low_power != 0,
++    }
++}
++
++/// Reads model/firmware, LED/IR, PIR and battery; errors of unsupported features are ignored
++async fn refresh(app: &App, name: &str, camera: &NeoInstance, active: bool) {
++    match read(camera, active, |c| {
++        Box::pin(async move { AnyResult::Ok(c.version().await?) })
++    })
++    .await
++    {
++        Ok(v) => {
++            update(app, name, |s| {
++                s.model = v.model.clone();
++                s.firmware = Some(v.firmwareVersion.clone());
++                s.hardware = Some(v.hardwareVersion.clone());
++                s.serial = Some(v.serialNumber.clone());
++            })
++            .await
++        }
++        Err(e) => log::debug!("{name}: version read failed: {e:#}"),
++    }
++    match read(camera, active, |c| {
++        Box::pin(async move { AnyResult::Ok(c.get_ledstate().await?) })
++    })
++    .await
++    {
++        Ok(l) => {
++            update(app, name, |s| {
++                s.led = Some(l.light_state == "open");
++                s.ir = Some(
++                    match l.state.as_str() {
++                        "open" => "on",
++                        "close" => "off",
++                        other => other,
++                    }
++                    .to_string(),
++                );
++            })
++            .await
++        }
++        Err(e) => log::debug!("{name}: LED state read failed: {e:#}"),
++    }
++    match read(camera, active, |c| {
++        Box::pin(async move { AnyResult::Ok(c.get_pirstate().await?) })
++    })
++    .await
++    {
++        Ok(p) => update(app, name, |s| s.pir = Some(p.enable != 0)).await,
++        Err(e) => log::debug!("{name}: PIR state read failed: {e:#}"),
++    }
++    match read(camera, active, |c| {
++        Box::pin(async move { AnyResult::Ok(c.battery_info().await?) })
++    })
++    .await
++    {
++        Ok(b) => update(app, name, |s| s.battery = Some(battery_state(&b))).await,
++        Err(e) => log::debug!("{name}: battery read failed: {e:#}"),
++    }
++}
++
++#[derive(Deserialize)]
++struct AuthQuery {
++    token: Option<String>,
++    max_age: Option<u64>,
++}
++
++fn authorized(app: &App, headers: &HeaderMap, query: &AuthQuery) -> bool {
++    let Some(token) = &app.token else {
++        return true;
++    };
++    if query.token.as_deref() == Some(token.as_str()) {
++        return true;
++    }
++    headers
++        .get(header::AUTHORIZATION)
++        .and_then(|v| v.to_str().ok())
++        .map(|v| v == format!("Bearer {token}"))
++        .unwrap_or(false)
++}
++
++async fn healthz(State(app): State<App>) -> Json<Value> {
++    let connected: HashMap<String, bool> = app
++        .states
++        .read()
++        .await
++        .iter()
++        .map(|(name, s)| (name.clone(), s.connected))
++        .collect();
++    Json(json!({"ok": true, "version": env!("NEOLINK_VERSION"), "cameras": connected}))
++}
++
++async fn snapshot(
++    State(app): State<App>,
++    Path(name): Path<String>,
++    headers: HeaderMap,
++    Query(query): Query<AuthQuery>,
++) -> Response {
++    if !authorized(&app, &headers, &query) {
++        return StatusCode::UNAUTHORIZED.into_response();
++    }
++    if !app.states.read().await.contains_key(&name) {
++        return (StatusCode::NOT_FOUND, format!("unknown camera `{name}`")).into_response();
++    }
++    if let Some(max_age) = query.max_age {
++        if let Some((taken, jpeg)) = app.snapshots.read().await.get(&name) {
++            if now().saturating_sub(*taken) <= max_age {
++                return ([(header::CONTENT_TYPE, "image/jpeg")], jpeg.clone()).into_response();
++            }
++        }
++    }
++    match take_snapshot(&app, &name).await {
++        Ok(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
++        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")).into_response(),
++    }
++}
++
++async fn take_snapshot(app: &App, name: &str) -> AnyResult<Vec<u8>> {
++    let camera = app.reactor.get(name).await?;
++    let jpeg = read(&camera, true, |c| {
++        Box::pin(async move { AnyResult::Ok(c.get_snapshot().await?) })
++    })
++    .await?;
++    app.snapshots
++        .write()
++        .await
++        .insert(name.to_string(), (now(), jpeg.clone()));
++    Ok(jpeg)
++}
++
++async fn ws_handler(
++    State(app): State<App>,
++    headers: HeaderMap,
++    Query(query): Query<AuthQuery>,
++    upgrade: WebSocketUpgrade,
++) -> Response {
++    if !authorized(&app, &headers, &query) {
++        return StatusCode::UNAUTHORIZED.into_response();
++    }
++    upgrade.on_upgrade(move |socket| client(app, socket))
++}
++
++async fn client(app: App, mut socket: WebSocket) {
++    let mut events = app.events.subscribe();
++    let hello = json!({
++        "type": "hello",
++        "version": env!("NEOLINK_VERSION"),
++        "cameras": cameras(&app).await,
++    });
++    if socket.send(Message::Text(hello.to_string())).await.is_err() {
++        return;
++    }
++    // Commands run concurrently (a sleeping camera may take a while); replies come back here
++    let (reply_tx, mut reply_rx) = mpsc::channel::<String>(32);
++    loop {
++        tokio::select! {
++            msg = socket.recv() => match msg {
++                Some(Ok(Message::Text(text))) => {
++                    let (app, tx) = (app.clone(), reply_tx.clone());
++                    tokio::spawn(async move {
++                        let reply = handle(&app, &text).await;
++                        let _ = tx.send(reply.to_string()).await;
++                    });
++                }
++                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
++                Some(Ok(_)) => {}
++            },
++            Some(reply) = reply_rx.recv() => {
++                if socket.send(Message::Text(reply)).await.is_err() {
++                    break;
++                }
++            },
++            event = events.recv() => match event {
++                Ok(event) => {
++                    if socket.send(Message::Text(event)).await.is_err() {
++                        break;
++                    }
++                }
++                Err(broadcast::error::RecvError::Lagged(_)) => {}
++                Err(broadcast::error::RecvError::Closed) => break,
++            },
++        }
++    }
++}
++
++#[derive(Deserialize)]
++struct Request {
++    id: Option<Value>,
++    command: String,
++    camera: Option<String>,
++    #[serde(default)]
++    args: Value,
++}
++
++async fn handle(app: &App, text: &str) -> Value {
++    let request: Request = match serde_json::from_str(text) {
++        Ok(r) => r,
++        Err(e) => {
++            return json!({"type": "result", "id": null, "success": false,
++                          "error": format!("invalid request: {e}")})
++        }
++    };
++    let id = request.id.clone().unwrap_or(Value::Null);
++    match command(app, &request).await {
++        Ok(result) => json!({"type": "result", "id": id, "success": true, "result": result}),
++        Err(e) => json!({"type": "result", "id": id, "success": false, "error": format!("{e:#}")}),
++    }
++}
++
++fn arg_bool(args: &Value, key: &str) -> AnyResult<bool> {
++    args.get(key)
++        .and_then(Value::as_bool)
++        .ok_or_else(|| anyhow!("missing boolean argument `{key}`"))
++}
++
++async fn command(app: &App, request: &Request) -> AnyResult<Value> {
++    if request.command == "list" {
++        return Ok(json!({"cameras": cameras(app).await}));
++    }
++    let name = request
++        .camera
++        .as_deref()
++        .ok_or_else(|| anyhow!("missing `camera`"))?;
++    if !app.states.read().await.contains_key(name) {
++        return Err(anyhow!("unknown camera `{name}`"));
++    }
++    let camera = app.reactor.get(name).await?;
++    let args = &request.args;
++    match request.command.as_str() {
++        "led" => {
++            let on = arg_bool(args, "on")?;
++            read(&camera, true, move |c| {
++                Box::pin(async move { AnyResult::Ok(c.led_light_set(on).await?) })
++            })
++            .await?;
++            update(app, name, |s| s.led = Some(on)).await;
++        }
++        "ir" => {
++            let label: &'static str = match args.get("state").and_then(Value::as_str) {
++                Some("on") => "on",
++                Some("off") => "off",
++                Some("auto") => "auto",
++                other => return Err(anyhow!("invalid IR state {other:?} (on|off|auto)")),
++            };
++            read(&camera, true, move |c| {
++                Box::pin(async move {
++                    let state = match label {
++                        "on" => LightState::On,
++                        "off" => LightState::Off,
++                        _ => LightState::Auto,
++                    };
++                    AnyResult::Ok(c.irled_light_set(state).await?)
++                })
++            })
++            .await?;
++            update(app, name, |s| s.ir = Some(label.to_string())).await;
++        }
++        "pir" => {
++            let on = arg_bool(args, "on")?;
++            read(&camera, true, move |c| {
++                Box::pin(async move { AnyResult::Ok(c.pir_set(on).await?) })
++            })
++            .await?;
++            update(app, name, |s| s.pir = Some(on)).await;
++        }
++        "reboot" => {
++            read(&camera, true, |c| {
++                Box::pin(async move { AnyResult::Ok(c.reboot().await?) })
++            })
++            .await?;
++        }
++        "siren" => {
++            read(&camera, true, |c| {
++                Box::pin(async move { AnyResult::Ok(c.siren().await?) })
++            })
++            .await?;
++        }
++        "battery" => {
++            let b = read(&camera, true, |c| {
++                Box::pin(async move { AnyResult::Ok(c.battery_info().await?) })
++            })
++            .await?;
++            update(app, name, |s| s.battery = Some(battery_state(&b))).await;
++        }
++        "refresh" => refresh(app, name, &camera, true).await,
++        "snapshot" => {
++            let jpeg = take_snapshot(app, name).await?;
++            return Ok(json!({"jpeg": BASE64.encode(jpeg)}));
++        }
++        "wakeup" => {
++            let minutes = args
++                .get("minutes")
++                .and_then(Value::as_u64)
++                .ok_or_else(|| anyhow!("missing integer argument `minutes`"))?;
++            let permit = camera.permit().await?;
++            tokio::spawn(async move {
++                // Start the countdown once the camera is actually connected
++                let _ = camera
++                    .run_task(|_| Box::pin(async move { AnyResult::Ok(()) }))
++                    .await;
++                sleep(Duration::from_secs(minutes * 60)).await;
++                drop(permit);
++            });
++        }
++        other => return Err(anyhow!("unknown command `{other}`")),
++    }
++    let state = app.states.read().await.get(name).cloned();
++    Ok(json!(state))
++}
+-- 
+2.54.0 (Apple Git-157)
+

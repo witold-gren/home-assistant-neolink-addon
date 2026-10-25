@@ -1,0 +1,53 @@
+From 2e776f1a9e8e332afc1bc1d25dc76ea941960a8d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Witold=20Gre=C5=84?= <witold.gren@gmail.com>
+Date: Mon, 19 Oct 2026 18:48:06 +0200
+Subject: [PATCH] log: local-time timestamps (TZ) instead of UTC
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Cargo.toml  |  1 +
+ src/main.rs | 16 +++++++++++++++-
+ 2 files changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/Cargo.toml b/Cargo.toml
+index d84661b..f2744f6 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -20,6 +20,7 @@ bytes = "1.6.0"
+ clap = { version = "4.2.2", features = ["derive", "cargo"] }
+ crossbeam-channel = {version = "0.5.8", optional = true}
+ dirs = {version = "5.0.1", optional = true}
++chrono = { version = "0.4", default-features = false, features = ["clock"] }
+ env_logger = "0.11.3"
+ fcm-push-listener = {version = "4.1.1", optional = true}
+ reqwest = {version = "0.13", optional = true}
+diff --git a/src/main.rs b/src/main.rs
+index a4febf6..bbb7a90 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -64,7 +64,21 @@ pub(crate) type AnyResult<T> = Result<T, anyhow::Error>;
+ 
+ #[tokio::main]
+ async fn main() -> Result<()> {
+-    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
++    // Local time (TZ from the Home Assistant Supervisor) instead of env_logger's
++    // UTC "...Z" stamps, so log lines match the clock in Home Assistant.
++    env_logger::Builder::from_env(Env::default().default_filter_or("info"))
++        .format(|buf, record| {
++            use std::io::Write;
++            writeln!(
++                buf,
++                "[{} {:<5} {}] {}",
++                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
++                record.level(),
++                record.target(),
++                record.args()
++            )
++        })
++        .init();
+ 
+     info!(
+         "Neolink {} {}",
+-- 
+2.54.0 (Apple Git-157)
+

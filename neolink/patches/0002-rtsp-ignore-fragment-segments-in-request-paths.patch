@@ -1,0 +1,108 @@
+From 7dc1d6d3131e90f803eb53aea3ae2a9b5f3a3c6f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Witold=20Gre=C5=84?= <witold.gren@gmail.com>
+Date: Sat, 17 Oct 2026 15:57:07 +0200
+Subject: [PATCH 2/7] rtsp: ignore #fragment segments in request paths
+
+go2rtc reads options such as #timeout=60 from the URL fragment, while
+ffmpeg sends the fragment to the server, which answered 404. Custom
+mount points drop every #... segment and keep the rest of the path.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/rtsp/gst/server.rs | 66 +++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 65 insertions(+), 1 deletion(-)
+
+diff --git a/src/rtsp/gst/server.rs b/src/rtsp/gst/server.rs
+index 46cb38c..d41a72e 100644
+--- a/src/rtsp/gst/server.rs
++++ b/src/rtsp/gst/server.rs
+@@ -13,7 +13,8 @@ use gstreamer_rtsp_server::{
+     gio::{TlsAuthenticationMode, TlsCertificate},
+     prelude::*,
+     subclass::prelude::*,
+-    RTSPAuth, RTSPFilterResult, RTSPServer, RTSPToken, RTSP_TOKEN_MEDIA_FACTORY_ROLE,
++    RTSPAuth, RTSPFilterResult, RTSPMountPoints, RTSPServer, RTSPToken,
++    RTSP_TOKEN_MEDIA_FACTORY_ROLE,
+ };
+ use log::*;
+ use std::{
+@@ -56,6 +57,7 @@ impl NeoRtspServer {
+             .build();
+         auth.set_default_token(Some(&mut un_authtoken));
+         factory.set_auth(Some(&auth));
++        factory.set_mount_points(Some(&Object::new::<NeoMountPoints>()));
+ 
+         factory.connect_client_connected(|_, client| {
+             client.connect_new_session(|_, session| {
+@@ -162,6 +164,68 @@ impl NeoRtspServer {
+     }
+ }
+ 
++glib::wrapper! {
++    /// Mount points that ignore `#...` URL fragments in the path
++    pub(crate) struct NeoMountPoints(ObjectSubclass<NeoMountPointsImpl>) @extends RTSPMountPoints;
++}
++
++/// Clients such as go2rtc take options from the URL fragment (`rtsp://.../cam/sub#timeout=60`),
++/// but ffmpeg sends the fragment to the server, which then answers 404. Drop every
++/// `#...` segment and keep the rest of the path (`/stream=0` in SETUP requests).
++#[derive(Default)]
++pub(crate) struct NeoMountPointsImpl;
++
++impl ObjectImpl for NeoMountPointsImpl {}
++
++#[object_subclass]
++impl ObjectSubclass for NeoMountPointsImpl {
++    const NAME: &'static str = "NeoMountPoints";
++    type Type = NeoMountPoints;
++    type ParentType = RTSPMountPoints;
++}
++
++impl RTSPMountPointsImpl for NeoMountPointsImpl {
++    fn make_path(&self, url: &gstreamer_rtsp::RTSPUrl) -> Option<glib::GString> {
++        let path = self.parent_make_path(url)?;
++        if !path.contains('#') {
++            return Some(path);
++        }
++        Some(strip_fragments(&path).into())
++    }
++}
++
++fn strip_fragments(path: &str) -> String {
++    let mut out = String::with_capacity(path.len());
++    let mut skipping = false;
++    for c in path.chars() {
++        match c {
++            '#' => skipping = true,
++            '/' => {
++                skipping = false;
++                out.push(c);
++            }
++            _ if !skipping => out.push(c),
++            _ => {}
++        }
++    }
++    out
++}
++
++#[cfg(test)]
++mod tests {
++    use super::strip_fragments;
++
++    #[test]
++    fn fragments_are_dropped() {
++        assert_eq!(strip_fragments("/G330/sub#timeout=60"), "/G330/sub");
++        assert_eq!(
++            strip_fragments("/G330/sub#timeout=60#media=video/stream=0"),
++            "/G330/sub/stream=0"
++        );
++        assert_eq!(strip_fragments("/G330/sub"), "/G330/sub");
++    }
++}
++
+ unsafe impl Send for NeoRtspServer {}
+ unsafe impl Sync for NeoRtspServer {}
+ 
+-- 
+2.54.0 (Apple Git-157)
+
