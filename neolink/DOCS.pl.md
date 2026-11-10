@@ -32,6 +32,19 @@ cameras:
     idle_disconnect: true
 ```
 
+## Nagrywanie podglądu
+Włącz dla kamery przełącznik **Nagrywaj podgląd** w integracji Neolink. Od tej chwili każdy podgląd
+tej kamery jest zapisywany w trakcie oglądania, bez przekodowania, w folderze mediów Home Assistant:
+`/media/neolink/<kamera>/<RRRR-MM-DD>/GGMMSS-GGMMSS.mp4` (Media → Moje media → neolink). Gdy nikt
+nie ogląda, nic się nie nagrywa, więc nie kosztuje to dodatkowego transferu ani baterii. Stare pliki
+zostają, dopóki nie włączysz `record_cleanup` (wtedy raz dziennie znikają starsze niż
+`record_keep_days`).
+
+## Mówienie przez kamerę
+Integracja Neolink pozwala dashboardowi (np. Home Dashboard) mówić przez głośnik kamery: mikrofon
+telefonu lub tabletu idzie przez Home Assistant do tej aplikacji, która koduje dźwięk dla kamery.
+Mówienie budzi kamerę; przez 4G głos dociera z opóźnieniem sekundy lub dwóch.
+
 ## Kamera 4G: transfer i bateria
 - `discovery: cellular` — łączy się wyłącznie przez serwery Reolink.
 - `stream: subStream` — około 110 kbit/s (0,8 MB na minutę oglądania).
@@ -51,6 +64,11 @@ Kilka nieudanych logowań może na jakiś czas zablokować kamerę.
 `log_level: debug` zapisuje w dzienniku szczegóły z samego Neolinka, w tym treść każdego
 powiadomienia push Reolink (linia `push payload: ...` zaraz po `push notification (motion)`).
 Biblioteki sieciowe i protokół kamery pozostają na poziomie `info`. Potem wróć do `info`.
+
+**Podgląd na żywo nie ma dźwięku** — do wersji 0.1.0 strumień RTSP niósł dźwięk jako surowe PCM,
+które odtwarzacz HLS w Home Assistant pomija, a go2rtc musiał je przekodować do WebRTC, zanim kamera
+się obudziła. Od 0.2.0 dźwięk idzie jako AAC i Opus. Jeśli dalej go nie ma, sprawdź w aplikacji
+Reolink, czy mikrofon kamery jest włączony.
 
 ## Fork
 Co dodają łatki i jak wygląda protokół WebSocket (po angielsku): [FORK.md](FORK.md).

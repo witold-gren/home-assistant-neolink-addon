@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.0
+- Sound in the live view: RTSP carries the camera's sound as AAC and as Opus instead of raw PCM.
+  Home Assistant's HLS player dropped PCM, and WebRTC through go2rtc had to transcode it with an
+  ffmpeg that gave up while the camera woke, so the live view had no sound.
+- Recorded live views: while someone watches a camera whose recording is switched on (switch in the
+  Neolink integration), the live view is written without transcoding to
+  `/media/neolink/<camera>/<YYYY-MM-DD>/HHMMSS-HHMMSS.mp4`. Options `record_cleanup` and
+  `record_keep_days` delete old ones (off by default).
+- Talking through the camera's speaker: `GET /talk/<camera>?rate=<Hz>` takes a browser microphone
+  (PCM 16-bit mono over a WebSocket) and plays it on the camera, encoded to its ADPCM. The Neolink
+  integration relays it for dashboards.
+
 ## 0.1.0
 First public release.
 

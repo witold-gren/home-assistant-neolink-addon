@@ -1,0 +1,471 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Witold=20Gre=C5=84?= <witold.gren@gmail.com>
+Date: Tue, 10 Nov 2026 18:58:46 +0100
+Subject: [PATCH] ws: talk through the camera speaker over a WebSocket
+
+GET /talk/{camera}?rate=<Hz> takes binary frames of PCM s16le mono (a browser
+microphone), encodes them to the camera's ADPCM with GStreamer and streams
+them to talk_stream; "stop" or closing ends it. The last message is
+{"ok": true} or {"ok": false, "error": busy|no_speaker|unreachable|failed}.
+talk_config() is shared with the talk subcommand.
+---
+diff --git a/src/talk/mod.rs b/src/talk/mod.rs
+index 2342188..e0b3a22 100644
+--- a/src/talk/mod.rs
++++ b/src/talk/mod.rs
+@@ -17,14 +17,13 @@ use neolink_core::bc::xml::TalkConfig;
+ mod cmdline;
+ mod gst;
+ 
+-use crate::common::NeoReactor;
++use crate::common::{NeoInstance, NeoReactor};
+ pub(crate) use cmdline::Opt;
+ 
+-/// Entry point for the talk subcommand
+-///
+-/// Opt is the command line options
+-pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
+-    let camera = reactor.get(&opt.camera).await?;
++/// What the camera plays: its talk config, the ADPCM block size and the sample rate. Asks the
++/// camera (wakes it): None when it has no speaker or no ADPCM talk, an error when it cannot be
++/// asked.
++pub(crate) async fn talk_config(camera: &NeoInstance) -> Result<Option<(TalkConfig, u16, u16)>> {
+     let config = camera.config().await?.borrow().clone();
+     let name = config.name.clone();
+ 
+@@ -36,13 +35,13 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
+             })
+         })
+         .await
+-        .with_context(|| format!("Camera {} does not support talk", name))?;
++        .with_context(|| format!("Cannot ask camera {} about talk", name))?;
+ 
+     if talk_ability.duplex_list.is_empty()
+         || talk_ability.audio_stream_mode_list.is_empty()
+         || talk_ability.audio_config_list.is_empty()
+     {
+-        return Err(anyhow!("Camera {} does not support talk", name));
++        return Ok(None);
+     }
+ 
+     // Just copy that data from the first talk ability in the config have never seen more
+@@ -63,12 +62,20 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
+ 
+     let block_size = (talk_config.audio_config.length_per_encoder / 2) + 4;
+     let sample_rate = talk_config.audio_config.sample_rate;
+-    if block_size == 0 || sample_rate == 0 {
+-        return Err(anyhow!(
+-            "The camera {} does not support talk with adpcm",
+-            name
+-        ));
++    if block_size == 0 || sample_rate == 0 || talk_config.audio_config.audio_type != "adpcm" {
++        return Ok(None);
+     }
++    Ok(Some((talk_config, block_size, sample_rate)))
++}
++
++/// Entry point for the talk subcommand
++///
++/// Opt is the command line options
++pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
++    let camera = reactor.get(&opt.camera).await?;
++    let (talk_config, block_size, sample_rate) = talk_config(&camera)
++        .await?
++        .ok_or_else(|| anyhow!("Camera {} does not support talk with adpcm", opt.camera))?;
+ 
+     let (mut set, rx) = match (&opt.file_path, &opt.microphone) {
+         (Some(path), false) => gst::from_input(
+diff --git a/src/ws/mod.rs b/src/ws/mod.rs
+index 63d9ee1..c35e1d4 100644
+--- a/src/ws/mod.rs
++++ b/src/ws/mod.rs
+@@ -8,6 +8,7 @@
+ //! - `GET /snapshot/{camera}` – a JPEG still (`?max_age=<s>` serves a cached one if fresh enough,
+ //!   `?cached=true` serves only the cached one and never wakes the camera, 404 if there is none)
+ //! - `GET /healthz` – liveness and which cameras are connected
++//! - `GET /talk/{camera}?rate=<Hz>` – WebSocket: PCM s16le mono to the camera's speaker (see `talk`)
+ //!
+ //! Battery cameras: background reads use passive tasks, so they never wake a camera that
+ //! disconnected for inactivity (`idle_disconnect`). Only explicit commands and snapshots do.
+@@ -54,6 +55,8 @@ use tokio::{
+ use tokio_util::sync::CancellationToken;
+ 
+ mod cmdline;
++#[cfg(feature = "gstreamer")]
++mod talk;
+ 
+ pub(crate) use cmdline::Opt;
+ 
+@@ -205,8 +208,10 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
+     let router = Router::new()
+         .route("/healthz", get(healthz))
+         .route("/ws", get(ws_handler))
+-        .route("/snapshot/:name", get(snapshot))
+-        .with_state(app.clone());
++        .route("/snapshot/:name", get(snapshot));
++    #[cfg(feature = "gstreamer")]
++    let router = router.route("/talk/:name", get(talk_handler));
++    let router = router.with_state(app.clone());
+     let addr = format!("{}:{}", ws_config.bind, ws_config.port);
+     let listener = tokio::net::TcpListener::bind(&addr)
+         .await
+@@ -672,6 +677,8 @@ fn record_cfg_state(s: &mut CameraState, r: &neolink_core::bc::xml::RecordCfg) {
+ #[derive(Deserialize)]
+ struct AuthQuery {
+     token: Option<String>,
++    /// `/talk`: the sample rate of the PCM the client sends
++    rate: Option<u32>,
+     max_age: Option<u64>,
+     cached: Option<bool>,
+     event: Option<bool>,
+@@ -888,6 +895,31 @@ async fn ws_handler(
+     upgrade.on_upgrade(move |socket| client(app, socket))
+ }
+ 
++/// `GET /talk/{camera}?rate=<Hz>`: a WebSocket of PCM s16le mono played on the camera's speaker
++#[cfg(feature = "gstreamer")]
++async fn talk_handler(
++    State(app): State<App>,
++    Path(name): Path<String>,
++    headers: HeaderMap,
++    Query(query): Query<AuthQuery>,
++    upgrade: WebSocketUpgrade,
++) -> Response {
++    if !authorized(&app, &headers, &query) {
++        return StatusCode::UNAUTHORIZED.into_response();
++    }
++    let Some(rate) = talk::talk_rate(query.rate) else {
++        return (StatusCode::BAD_REQUEST, "rate must be 8000-48000 Hz").into_response();
++    };
++    if !app.states.read().await.contains_key(&name) {
++        return StatusCode::NOT_FOUND.into_response();
++    }
++    let camera = match app.reactor.get(&name).await {
++        Ok(camera) => camera,
++        Err(_) => return StatusCode::NOT_FOUND.into_response(),
++    };
++    upgrade.on_upgrade(move |socket| talk::serve(socket, camera, name, rate))
++}
++
+ async fn client(app: App, mut socket: WebSocket) {
+     let mut events = app.events.subscribe();
+     let hello = json!({
+diff --git a/src/ws/talk.rs b/src/ws/talk.rs
+new file mode 100644
+index 0000000..a114572
+--- /dev/null
++++ b/src/ws/talk.rs
+@@ -0,0 +1,310 @@
++//! `GET /talk/{camera}?rate=<Hz>` – talk through a camera's speaker over a WebSocket
++//!
++//! The client sends binary frames of 16-bit little-endian mono PCM at `rate` (a browser's
++//! microphone, e.g. 48000), then the text `stop`; closing the socket stops too. The sound is
++//! resampled and encoded to the camera's own ADPCM (DVI) by GStreamer and streamed to the camera
++//! as it comes. The last message is the outcome, `{"ok": true}` or
++//! `{"ok": false, "error": "busy" | "no_speaker" | "unreachable" | "failed"}`.
++//! One talker per camera at a time: a second one gets `busy`.
++use anyhow::{anyhow, Context, Result};
++use axum::extract::ws::{Message, WebSocket};
++use crossbeam_channel::{bounded, Receiver, Sender};
++use gstreamer::{prelude::*, Caps, Element, ElementFactory, FlowError, FlowSuccess, Pipeline};
++use gstreamer_app::{AppSink, AppSinkCallbacks, AppSrc, AppStreamType};
++use serde_json::{json, Value};
++use std::{
++    collections::HashSet,
++    sync::{Mutex, OnceLock},
++};
++
++use crate::common::NeoInstance;
++
++/// Sample rates a client may send
++pub(crate) const RATES: std::ops::RangeInclusive<u32> = 8000..=48000;
++/// ADPCM blocks waiting for the camera; a full queue drops the oldest sound, never blocks the talker
++const QUEUE_BLOCKS: usize = 30;
++
++static TALKING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
++
++fn talking() -> &'static Mutex<HashSet<String>> {
++    TALKING.get_or_init(Default::default)
++}
++
++/// The sample rate asked for, when it is one a microphone gives
++pub(crate) fn talk_rate(rate: Option<u32>) -> Option<u32> {
++    rate.filter(|rate| RATES.contains(rate))
++}
++
++/// The outcome message of a talk
++pub(crate) fn outcome(error: Option<&str>) -> Value {
++    match error {
++        None => json!({"ok": true}),
++        Some(error) => json!({"ok": false, "error": error}),
++    }
++}
++
++fn element(kind: &str) -> Result<Element> {
++    ElementFactory::make(kind)
++        .build()
++        .with_context(|| format!("GStreamer element {kind} is missing"))
++}
++
++/// PCM s16le mono at `rate` in, the camera's ADPCM blocks out (to `tx`)
++pub(crate) struct Encoder {
++    pipeline: Pipeline,
++    src: AppSrc,
++}
++
++impl Encoder {
++    pub(crate) fn new(
++        rate: u32,
++        camera_rate: u16,
++        block_align: u16,
++        tx: Sender<Vec<u8>>,
++    ) -> Result<Encoder> {
++        let pipeline = Pipeline::new();
++        let src = element("appsrc")?
++            .dynamic_cast::<AppSrc>()
++            .map_err(|_| anyhow!("Cannot cast to appsrc"))?;
++        src.set_caps(Some(
++            &Caps::builder("audio/x-raw")
++                .field("format", "S16LE")
++                .field("layout", "interleaved")
++                .field("rate", rate as i32)
++                .field("channels", 1i32)
++                .build(),
++        ));
++        src.set_format(gstreamer::Format::Time);
++        src.set_is_live(true);
++        src.set_do_timestamp(true);
++        src.set_stream_type(AppStreamType::Stream);
++        let convert = element("audioconvert")?;
++        let resample = element("audioresample")?;
++        let caps = element("capsfilter")?;
++        caps.set_property(
++            "caps",
++            Caps::builder("audio/x-raw")
++                .field("rate", camera_rate as i32)
++                .field("channels", 1i32)
++                .build(),
++        );
++        let encoder = element("adpcmenc")?;
++        encoder.set_property("blockalign", block_align as i32);
++        encoder.set_property_from_str("layout", "dvi");
++        let sink = element("appsink")?
++            .dynamic_cast::<AppSink>()
++            .map_err(|_| anyhow!("Cannot cast to appsink"))?;
++        sink.set_property("sync", false);
++        sink.set_callbacks(
++            AppSinkCallbacks::builder()
++                .new_sample(move |sink| {
++                    let sample = sink.pull_sample().map_err(|_| FlowError::Eos)?;
++                    let block = sample
++                        .buffer()
++                        .and_then(|b| b.map_readable().ok().map(|m| m.to_vec()))
++                        .ok_or(FlowError::Error)?;
++                    // The camera is gone: stop encoding
++                    tx.try_send(block).or_else(|e| match e {
++                        crossbeam_channel::TrySendError::Full(_) => Ok(()),
++                        crossbeam_channel::TrySendError::Disconnected(_) => Err(FlowError::Eos),
++                    })?;
++                    Ok(FlowSuccess::Ok)
++                })
++                .build(),
++        );
++        pipeline.add_many([
++            src.upcast_ref(),
++            &convert,
++            &resample,
++            &caps,
++            &encoder,
++            sink.upcast_ref(),
++        ])?;
++        Element::link_many([
++            src.upcast_ref(),
++            &convert,
++            &resample,
++            &caps,
++            &encoder,
++            sink.upcast_ref(),
++        ])?;
++        pipeline.set_state(gstreamer::State::Playing)?;
++        Ok(Encoder { pipeline, src })
++    }
++
++    /// A frame of PCM from the client; an odd trailing byte is dropped
++    pub(crate) fn push(&self, pcm: &[u8]) -> Result<()> {
++        let even = &pcm[..pcm.len() - pcm.len() % 2];
++        if even.is_empty() {
++            return Ok(());
++        }
++        self.src
++            .push_buffer(gstreamer::Buffer::from_slice(even.to_vec()))
++            .map(|_| ())
++            .map_err(|e| anyhow!("The talk encoder stopped: {e:?}"))
++    }
++
++    /// Let the last sound out, then stop
++    pub(crate) fn finish(self) {
++        let _ = self.src.end_of_stream();
++        if let Some(bus) = self.pipeline.bus() {
++            bus.timed_pop_filtered(
++                gstreamer::ClockTime::from_seconds(2),
++                &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
++            );
++        }
++        let _ = self.pipeline.set_state(gstreamer::State::Null);
++    }
++}
++
++/// Serve one talker on `socket` for `camera` (`name`)
++pub(crate) async fn serve(mut socket: WebSocket, camera: NeoInstance, name: String, rate: u32) {
++    let error = if talking()
++        .lock()
++        .map(|mut t| t.insert(name.clone()))
++        .unwrap_or(false)
++    {
++        let error = talk(&mut socket, &camera, &name, rate).await.err();
++        if let Ok(mut t) = talking().lock() {
++            t.remove(&name);
++        }
++        error
++    } else {
++        Some(TalkError::Busy)
++    };
++    if let Some(error) = &error {
++        log::info!("{name}: talk ended: {error}");
++    }
++    let message = outcome(error.as_ref().map(TalkError::code));
++    let _ = socket.send(Message::Text(message.to_string())).await;
++    let _ = socket.close().await;
++}
++
++#[derive(Debug)]
++pub(crate) enum TalkError {
++    Busy,
++    NoSpeaker,
++    Unreachable(anyhow::Error),
++    Failed(anyhow::Error),
++}
++
++impl TalkError {
++    pub(crate) fn code(&self) -> &'static str {
++        match self {
++            TalkError::Busy => "busy",
++            TalkError::NoSpeaker => "no_speaker",
++            TalkError::Unreachable(_) => "unreachable",
++            TalkError::Failed(_) => "failed",
++        }
++    }
++}
++
++impl std::fmt::Display for TalkError {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            TalkError::Busy => write!(f, "someone is talking already"),
++            TalkError::NoSpeaker => write!(f, "the camera has no speaker for talk (ADPCM)"),
++            TalkError::Unreachable(e) | TalkError::Failed(e) => {
++                write!(f, "{e:#}")
++            }
++        }
++    }
++}
++
++async fn talk(
++    socket: &mut WebSocket,
++    camera: &NeoInstance,
++    name: &str,
++    rate: u32,
++) -> std::result::Result<(), TalkError> {
++    let (talk_config, block_align, camera_rate) = crate::talk::talk_config(camera)
++        .await
++        .map_err(TalkError::Unreachable)?
++        .ok_or(TalkError::NoSpeaker)?;
++    let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = bounded(QUEUE_BLOCKS);
++    let encoder = Encoder::new(rate, camera_rate, block_align, tx).map_err(TalkError::Failed)?;
++    log::info!("{name}: talking ({rate} Hz in, ADPCM {camera_rate} Hz to the camera)");
++    let mut playing = Box::pin(camera.run_task(move |cam| {
++        let rx = rx.clone();
++        let talk_config = talk_config.clone();
++        Box::pin(async move {
++            cam.talk_stream(rx, talk_config).await?;
++            Ok(())
++        })
++    }));
++
++    let result = loop {
++        tokio::select! {
++            message = socket.recv() => match message {
++                Some(Ok(Message::Binary(pcm))) => {
++                    if let Err(e) = encoder.push(&pcm) {
++                        break Err(TalkError::Failed(e));
++                    }
++                }
++                Some(Ok(Message::Text(text))) if text.trim() == "stop" => break Ok(()),
++                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break Ok(()),
++                Some(Ok(_)) => {}
++            },
++            ended = &mut playing => {
++                break match ended {
++                    Ok(()) => Err(TalkError::Failed(anyhow!("the camera ended the talk"))),
++                    Err(e) => Err(TalkError::Unreachable(e)),
++                };
++            }
++        }
++    };
++    // The end of the sound ends the camera's stream (the channel closes with the encoder)
++    encoder.finish();
++    if result.is_ok() {
++        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), playing).await;
++    }
++    result
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn rates_a_microphone_gives() {
++        assert_eq!(talk_rate(Some(48000)), Some(48000));
++        assert_eq!(talk_rate(Some(16000)), Some(16000));
++        assert_eq!(talk_rate(Some(96000)), None);
++        assert_eq!(talk_rate(None), None);
++    }
++
++    #[test]
++    fn outcomes_follow_the_dashboard_contract() {
++        assert_eq!(outcome(None), json!({"ok": true}));
++        assert_eq!(
++            outcome(Some(TalkError::Busy.code())),
++            json!({"ok": false, "error": "busy"})
++        );
++        assert_eq!(TalkError::NoSpeaker.code(), "no_speaker");
++        assert_eq!(TalkError::Unreachable(anyhow!("x")).code(), "unreachable");
++    }
++
++    #[test]
++    fn microphone_pcm_becomes_camera_adpcm_blocks() {
++        gstreamer::init().unwrap();
++        // A Reolink speaker: 16 kHz ADPCM, lengthPerEncoder 1024 -> blocks of 1024/2 + 4 bytes
++        let (tx, rx) = bounded(1000);
++        let encoder = Encoder::new(48000, 16000, 516, tx).unwrap();
++        // One second of a 440 Hz tone at 48 kHz, as a browser sends it (20 ms frames)
++        let samples: Vec<u8> = (0..48000)
++            .flat_map(|i| {
++                let v =
++                    (f64::sin(i as f64 * 440.0 * std::f64::consts::TAU / 48000.0) * 8000.0) as i16;
++                v.to_le_bytes()
++            })
++            .collect();
++        for frame in samples.chunks(1920) {
++            encoder.push(frame).unwrap();
++        }
++        encoder.finish();
++        let blocks: Vec<Vec<u8>> = rx.try_iter().collect();
++        // 16000 samples of 4-bit ADPCM in blocks of 1025 samples (1 in the header + 1024)
++        assert!(blocks.len() >= 14, "{} blocks", blocks.len());
++        assert!(blocks.iter().all(|b| b.len() == 516));
++    }
++}
+-- 
+2.50.0
+

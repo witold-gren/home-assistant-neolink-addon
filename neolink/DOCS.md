@@ -32,6 +32,18 @@ cameras:
     idle_disconnect: true
 ```
 
+## Recorded live views
+Switch **Record live view** on for a camera in the Neolink integration. From then on every live view
+of that camera is written, as it is watched and without transcoding, to Home Assistant's media folder:
+`/media/neolink/<camera>/<YYYY-MM-DD>/HHMMSS-HHMMSS.mp4` (Media → My media → neolink). Nothing is
+recorded while nobody watches, so it costs no extra data or battery. Old files stay until you switch
+on `record_cleanup` (then those older than `record_keep_days` go once a day).
+
+## Talking through the camera
+The Neolink integration lets a dashboard (e.g. Home Dashboard) talk through the camera's speaker:
+the microphone of the phone or tablet goes over Home Assistant to this app, which encodes it for the
+camera. Talking wakes the camera; over 4G expect a delay of a second or two.
+
 ## 4G camera: data and battery
 - `discovery: cellular` — connects only through Reolink's servers.
 - `stream: subStream` — about 110 kbit/s (0.8 MB per minute of viewing).
@@ -51,6 +63,11 @@ password. A few failed logins can lock the camera for a while.
 `log_level: debug` writes details from Neolink itself to the log, including the content of every
 Reolink push notification (the `push payload: ...` line right after `push notification (motion)`).
 Network libraries and the camera protocol stay at `info`. Go back to `info` afterwards.
+
+**The live view has no sound** — up to 0.1.0 the RTSP stream carried the sound as raw PCM, which Home
+Assistant's HLS player drops and go2rtc had to transcode for WebRTC while the camera was still waking.
+From 0.2.0 the sound comes as AAC and Opus. If there is still none, check that the camera's microphone
+is on in the Reolink app.
 
 ## The fork
 What the patches add and the WebSocket protocol: [FORK.md](FORK.md).

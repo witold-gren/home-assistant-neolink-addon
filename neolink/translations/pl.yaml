@@ -14,6 +14,12 @@ configuration:
   motion_seconds:
     name: Czas wykrycia ruchu (s)
     description: Jak długo czujnik ruchu pozostaje włączony po powiadomieniu. Kolejne powiadomienie liczy czas od nowa.
+  record_cleanup:
+    name: Usuwaj stare nagrania
+    description: Usuwa nagrane podglądy (/media/neolink) starsze niż liczba dni poniżej. Wyłączone zostawia wszystkie. Samo nagrywanie włącza się dla każdej kamery w integracji Neolink.
+  record_keep_days:
+    name: Przechowuj nagrania (dni)
+    description: Jak długo trzymać nagrane podglądy, gdy usuwanie starych nagrań jest włączone.
   cameras:
     name: Kamery
     description: >-

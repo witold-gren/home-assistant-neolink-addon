@@ -20,7 +20,19 @@ app's Dockerfile:
   task ends when nobody takes frames for 15 s;
 - optional PIR XML fields (`rfID`, `sensitivity`, `timeBlockList`, `alarmHandle`): the Reolink Go Plus
   does not send them and a parse error dropped the connection;
-- log timestamps in local time (`TZ`).
+- log timestamps in local time (`TZ`);
+- the camera's sound in RTSP as two tracks, AAC (`pay1`, for HLS and recordings) and Opus (`pay2`, for
+  WebRTC), instead of raw PCM (`rtpL16pay`);
+- recorded live views: `[websocket] record_dir` (and `record_switches`, default `<record_dir>/.switches`)
+  turn it on; while an RTSP client watches a camera whose switch is on, the frames it gets are muxed
+  as they come into a fragmented mp4, `<record_dir>/<camera>/<YYYY-MM-DD>/HHMMSS-HHMMSS.mp4` (local
+  time; `HHMMSS-recording.mp4` while written, renamed after a crash on the next start). One recording
+  per camera at a time; ADPCM sound is left out (AAC is kept);
+- talking through the speaker: `GET /talk/{camera}?rate=<Hz>` (WebSocket, token as for `/ws`) takes
+  binary frames of PCM s16le mono at `rate` (8000-48000), encodes them with GStreamer to the camera's
+  ADPCM (`TalkAbility`, e.g. DVI 16 kHz, blocks of `lengthPerEncoder / 2 + 4` bytes) and streams them
+  to the camera; the text `stop` or closing the socket ends it. The last message is `{"ok": true}` or
+  `{"ok": false, "error": "busy" | "no_speaker" | "unreachable" | "failed"}`; one talker per camera.
 
 ## WebSocket protocol
 The client sends `{"id": 1, "command": "...", "camera": "Garden", "args": {...}}`, the bridge answers
@@ -39,6 +51,7 @@ The client sends `{"id": 1, "command": "...", "camera": "Garden", "args": {...}}
 | `pir_reduce_false_alarm`, `recording`, `alarm_sound` | `on: bool` | yes |
 | `post_record` | `seconds: int` (one of `post_record_options`, e.g. 8/15/30) | yes |
 | `push` | `on: bool` (push notifications from the camera; off = no motion in HA) | yes |
+| `record_live` | `on: bool` (record watched live views; local, see above) | no |
 | `probe` | `msg_id: int` (diagnostics: answer code; XML in the log with the camera's `debug = true`) | yes |
 
 `GET /snapshot/{camera}?event=true` returns the picture taken after the last motion notification
@@ -51,5 +64,5 @@ card), `Net3g4gInfo` 255 (4G signal; the camera sends it by itself every few sec
 returns 405).
 
 Events: `{"type": "event", "event": "state", "camera": "...", "state": {...}}` on every change
-(connection, battery, LED/IR/PIR, motion). The first message after connecting:
+(connection, battery, LED/IR/PIR, motion, `record_live`, `recording_live`). The first message after connecting:
 `{"type": "hello", "version": "...", "cameras": [...]}`.

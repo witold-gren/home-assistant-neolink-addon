@@ -1,0 +1,173 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Witold=20Gre=C5=84?= <witold.gren@gmail.com>
+Date: Tue, 10 Nov 2026 17:51:46 +0100
+Subject: [PATCH] rtsp: pay audio as AAC and Opus instead of raw PCM
+
+Home Assistant's HLS stream drops L16 audio, and WebRTC through go2rtc had to
+transcode it with its own ffmpeg, which gave up while a sleeping camera woke.
+The decoded sound is now paid twice: AAC (pay1) and Opus (pay2).
+---
+diff --git a/src/rtsp/factory.rs b/src/rtsp/factory.rs
+index dd26da8..37c6114 100644
+--- a/src/rtsp/factory.rs
++++ b/src/rtsp/factory.rs
+@@ -687,16 +687,71 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
+ 
+ fn build_aac(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
+     let linked = pipe_aac(bin, stream_config)?;
++    pay_audio(bin, &linked.output)?;
++    Ok(linked.appsrc)
++}
++
++/// The encoders of the two audio tracks: AAC for the players and recorders that take it (Home
++/// Assistant's HLS stream, mp4 files) and Opus for WebRTC, so that a client such as go2rtc never has
++/// to transcode raw PCM itself while a battery camera is still waking.
++pub(crate) const AAC_ENCODERS: [&str; 2] = ["avenc_aac", "voaacenc"];
++pub(crate) const OPUS_ENCODER: &str = "opusenc";
+ 
++/// Pay the decoded audio twice: AAC as `pay1` and Opus as `pay2`, both from one `tee`.
++fn pay_audio(bin: &Element, output: &Element) -> Result<()> {
+     let bin = bin
+         .clone()
+         .dynamic_cast::<Bin>()
+         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
+ 
+-    let payload = make_element("rtpL16pay", "pay1")?;
+-    bin.add_many([&payload])?;
+-    Element::link_many([&linked.output, &payload])?;
+-    Ok(linked.appsrc)
++    let tee = make_element("tee", "audtee")?;
++
++    let aac_queue = make_queue("audaacqueue", 512 * 1416)?;
++    let aac_convert = make_element("audioconvert", "audaacconvert")?;
++    let aac_resample = make_element("audioresample", "audaacresample")?;
++    let aac_encoder = AAC_ENCODERS
++        .iter()
++        .find_map(|kind| make_element(kind, "audaacencoder").ok())
++        .ok_or_else(|| anyhow!("No AAC encoder: install gst-libav or gst-plugins-bad"))?;
++    let aac_payload = make_element("rtpmp4gpay", "pay1")?;
++
++    let opus_queue = make_queue("audopusqueue", 512 * 1416)?;
++    let opus_convert = make_element("audioconvert", "audopusconvert")?;
++    let opus_resample = make_element("audioresample", "audopusresample")?;
++    let opus_encoder = make_element(OPUS_ENCODER, "audopusencoder")?;
++    let opus_payload = make_element("rtpopuspay", "pay2")?;
++
++    bin.add_many([
++        &tee,
++        &aac_queue,
++        &aac_convert,
++        &aac_resample,
++        &aac_encoder,
++        &aac_payload,
++        &opus_queue,
++        &opus_convert,
++        &opus_resample,
++        &opus_encoder,
++        &opus_payload,
++    ])?;
++    Element::link_many([output, &tee])?;
++    Element::link_many([
++        &tee,
++        &aac_queue,
++        &aac_convert,
++        &aac_resample,
++        &aac_encoder,
++        &aac_payload,
++    ])?;
++    Element::link_many([
++        &tee,
++        &opus_queue,
++        &opus_convert,
++        &opus_resample,
++        &opus_encoder,
++        &opus_payload,
++    ])?;
++    Ok(())
+ }
+ 
+ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> Result<Linked> {
+@@ -763,15 +818,7 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
+ 
+ fn build_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> Result<AppSrc> {
+     let linked = pipe_adpcm(bin, block_size, stream_config)?;
+-
+-    let bin = bin
+-        .clone()
+-        .dynamic_cast::<Bin>()
+-        .map_err(|_| anyhow!("Media source's element should be a bin"))?;
+-
+-    let payload = make_element("rtpL16pay", "pay1")?;
+-    bin.add_many([&payload])?;
+-    Element::link_many([&linked.output, &payload])?;
++    pay_audio(bin, &linked.output)?;
+     Ok(linked.appsrc)
+ }
+ 
+@@ -967,3 +1014,63 @@ fn buffer_size(bitrate: u32) -> u32 {
+     // 0.1 seconds (according to bitrate) or 4kb what ever is larger
+     std::cmp::max(bitrate * 2 / 8u32, 4u32 * 1024u32)
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use gstreamer::Pipeline;
++    use gstreamer_app::AppSink;
++
++    /// A sink on a payloader's output, to catch the RTP packets it makes.
++    fn catch(pipeline: &Pipeline, payloader: &str) -> AppSink {
++        let sink = make_element("appsink", &format!("{payloader}_sink"))
++            .unwrap()
++            .dynamic_cast::<AppSink>()
++            .unwrap();
++        sink.set_property("sync", false);
++        pipeline.add(&sink).unwrap();
++        pipeline.by_name(payloader).unwrap().link(&sink).unwrap();
++        sink
++    }
++
++    #[test]
++    fn decoded_audio_is_paid_as_aac_and_opus() {
++        gstreamer::init().unwrap();
++        let pipeline = Pipeline::new();
++        let source = make_element("audiotestsrc", "testsrc").unwrap();
++        source.set_property("num-buffers", 50i32);
++        // The camera's sound after decoding: 16 kHz mono, as a Reolink sends AAC
++        let caps = make_element("capsfilter", "testcaps").unwrap();
++        caps.set_property(
++            "caps",
++            Caps::builder("audio/x-raw")
++                .field("rate", 16000i32)
++                .field("channels", 1i32)
++                .build(),
++        );
++        let output = make_element("audioconvert", "testconvert").unwrap();
++        pipeline.add_many([&source, &caps, &output]).unwrap();
++        Element::link_many([&source, &caps, &output]).unwrap();
++        pay_audio(pipeline.upcast_ref::<Element>(), &output).unwrap();
++
++        let sinks: Vec<AppSink> = ["pay1", "pay2"]
++            .iter()
++            .map(|payloader| catch(&pipeline, payloader))
++            .collect();
++        pipeline.set_state(gstreamer::State::Playing).unwrap();
++
++        let encodings: Vec<String> = sinks
++            .iter()
++            .map(|sink| {
++                let sample = sink
++                    .try_pull_sample(ClockTime::from_seconds(10))
++                    .expect("no RTP packet came out");
++                let structure = sample.caps().unwrap().structure(0).unwrap().to_owned();
++                structure.get::<String>("encoding-name").unwrap()
++            })
++            .collect();
++        pipeline.set_state(gstreamer::State::Null).unwrap();
++
++        assert_eq!(encodings, ["MPEG4-GENERIC", "OPUS"]);
++    }
++}
+-- 
+2.50.0
+

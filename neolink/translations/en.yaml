@@ -14,6 +14,12 @@ configuration:
   motion_seconds:
     name: Motion hold time (s)
     description: How long the motion sensor stays on after a notification. A further notification restarts the countdown.
+  record_cleanup:
+    name: Delete old recordings
+    description: Delete recorded live views (/media/neolink) older than the days below. Off keeps them all. Recording itself is switched on per camera in the Neolink integration.
+  record_keep_days:
+    name: Keep recordings (days)
+    description: How long recorded live views are kept when deleting old recordings is on.
   cameras:
     name: Cameras
     description: >-

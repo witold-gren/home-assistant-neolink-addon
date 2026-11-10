@@ -1,0 +1,813 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Witold=20Gre=C5=84?= <witold.gren@gmail.com>
+Date: Tue, 10 Nov 2026 18:00:34 +0100
+Subject: [PATCH] ws, rtsp: record watched live views to mp4 files
+
+While an RTSP client watches a camera whose recording is switched on, the
+frames it gets are muxed as they come (no transcoding) into a fragmented mp4
+at <record_dir>/<camera>/<YYYY-MM-DD>/HHMMSS-HHMMSS.mp4. One recording per
+camera at a time. The switch (ws command record_live) is a file in
+record_switches, the state carries record_live and recording_live.
+---
+diff --git a/src/config.rs b/src/config.rs
+index 7d9d4a6..fe503f1 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -82,6 +82,13 @@ pub(crate) struct WebsocketConfig {
+     /// How long (s) `motion` stays on after a push notification (cameras with `push_notifications`)
+     #[serde(default = "default_ws_motion_timeout")]
+     pub(crate) motion_timeout: u64,
++    /// Where watched live views are recorded (`<camera>/<YYYY-MM-DD>/HHMMSS-HHMMSS.mp4`);
++    /// unset turns recording off
++    #[serde(default)]
++    pub(crate) record_dir: Option<String>,
++    /// Where the recording switch of each camera is kept (default `<record_dir>/.switches`)
++    #[serde(default)]
++    pub(crate) record_switches: Option<String>,
+ }
+ 
+ impl Default for WebsocketConfig {
+@@ -95,6 +102,8 @@ impl Default for WebsocketConfig {
+             snapshot_dir: None,
+             snapshot_refresh: default_ws_snapshot_refresh(),
+             motion_timeout: default_ws_motion_timeout(),
++            record_dir: None,
++            record_switches: None,
+         }
+     }
+ }
+diff --git a/src/main.rs b/src/main.rs
+index bbb7a90..3dee0a5 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -46,6 +46,7 @@ mod mqtt;
+ mod pir;
+ mod ptz;
+ mod reboot;
++mod record;
+ #[cfg(feature = "gstreamer")]
+ mod rtsp;
+ mod services;
+diff --git a/src/record.rs b/src/record.rs
+new file mode 100644
+index 0000000..d27b175
+--- /dev/null
++++ b/src/record.rs
+@@ -0,0 +1,213 @@
++//! Live-view recording: settings and switches
++//!
++//! While an RTSP client watches a camera whose recording is switched on, the frames it gets are
++//! also written, as they come, to `<dir>/<camera>/<YYYY-MM-DD>/HHMMSS-HHMMSS.mp4` (local time;
++//! see `rtsp::recorder`). The switch of each camera is a file in `switches`, so it survives a
++//! restart; `recording` tells who records right now, for the WebSocket state.
++use anyhow::{Context, Result};
++use std::{
++    collections::HashSet,
++    path::{Path, PathBuf},
++    sync::{Mutex, OnceLock},
++};
++use tokio::sync::broadcast;
++
++#[derive(Debug)]
++struct Settings {
++    dir: PathBuf,
++    switches: PathBuf,
++    changes: broadcast::Sender<String>,
++}
++
++static SETTINGS: OnceLock<Settings> = OnceLock::new();
++static RECORDING: Mutex<Option<HashSet<String>>> = Mutex::new(None);
++
++/// Turn recording on for this process: files go to `dir`, the switches are kept in `switches`.
++pub(crate) fn init(dir: &str, switches: &str) {
++    let (changes, _) = broadcast::channel(16);
++    let _ = SETTINGS.set(Settings {
++        dir: PathBuf::from(dir),
++        switches: PathBuf::from(switches),
++        changes,
++    });
++}
++
++/// Where the recordings of `camera` go, when recording is set up at all
++pub(crate) fn camera_dir(camera: &str) -> Option<PathBuf> {
++    SETTINGS.get().map(|s| s.dir.join(file_name(camera)))
++}
++
++fn switch_path(settings: &Settings, camera: &str) -> PathBuf {
++    settings.switches.join(file_name(camera))
++}
++
++/// A camera name as one path segment: no separators, no `..`
++fn file_name(camera: &str) -> String {
++    let name: String = camera
++        .chars()
++        .map(|c| {
++            if matches!(c, '/' | '\\' | '\0') {
++                '_'
++            } else {
++                c
++            }
++        })
++        .collect();
++    if name.trim_matches('.').is_empty() {
++        "_".to_string()
++    } else {
++        name
++    }
++}
++
++/// Whether live views of `camera` are recorded
++pub(crate) fn enabled(camera: &str) -> bool {
++    SETTINGS
++        .get()
++        .is_some_and(|s| switch_path(s, camera).exists())
++}
++
++/// Switch the recording of `camera` on or off
++pub(crate) fn set_enabled(camera: &str, on: bool) -> Result<()> {
++    let settings = SETTINGS
++        .get()
++        .context("live-view recording is not set up (record_dir)")?;
++    let path = switch_path(settings, camera);
++    if on {
++        std::fs::create_dir_all(&settings.switches)
++            .with_context(|| format!("Cannot create {}", settings.switches.display()))?;
++        std::fs::write(&path, b"on").with_context(|| format!("Cannot write {}", path.display()))?;
++    } else if path.exists() {
++        std::fs::remove_file(&path).with_context(|| format!("Cannot remove {}", path.display()))?;
++    }
++    let _ = settings.changes.send(camera.to_string());
++    Ok(())
++}
++
++/// Whether a live view of `camera` is being recorded right now
++pub(crate) fn recording(camera: &str) -> bool {
++    RECORDING
++        .lock()
++        .map(|r| r.as_ref().is_some_and(|set| set.contains(camera)))
++        .unwrap_or(false)
++}
++
++/// Claim the recording of `camera`: false when another live view of it records already
++pub(crate) fn claim(camera: &str) -> bool {
++    let claimed = RECORDING
++        .lock()
++        .map(|mut r| {
++            r.get_or_insert_with(HashSet::new)
++                .insert(camera.to_string())
++        })
++        .unwrap_or(false);
++    if claimed {
++        notify(camera);
++    }
++    claimed
++}
++
++/// Let the recording of `camera` go
++pub(crate) fn release(camera: &str) {
++    if let Ok(mut r) = RECORDING.lock() {
++        if let Some(set) = r.as_mut() {
++            set.remove(camera);
++        }
++    }
++    notify(camera);
++}
++
++fn notify(camera: &str) {
++    if let Some(settings) = SETTINGS.get() {
++        let _ = settings.changes.send(camera.to_string());
++    }
++}
++
++/// Names of cameras whose switch or recording changed
++pub(crate) fn subscribe() -> Option<broadcast::Receiver<String>> {
++    SETTINGS.get().map(|s| s.changes.subscribe())
++}
++
++/// The final name of a recording that ran from `start` to `end`: `HHMMSS-HHMMSS.mp4`
++pub(crate) fn final_name(start: &chrono::NaiveTime, end: &chrono::NaiveTime) -> String {
++    format!("{}-{}.mp4", start.format("%H%M%S"), end.format("%H%M%S"))
++}
++
++/// A recording still being written, or one cut short by a crash: `HHMMSS-recording.mp4`
++pub(crate) fn partial_name(start: &chrono::NaiveTime) -> String {
++    format!("{}-recording.mp4", start.format("%H%M%S"))
++}
++
++/// Give recordings cut short by a restart their final name, from the time of their last write
++pub(crate) fn finish_partial(dir: &Path) {
++    let Ok(days) = std::fs::read_dir(dir) else {
++        return;
++    };
++    for day in days.flatten() {
++        let Ok(files) = std::fs::read_dir(day.path()) else {
++            continue;
++        };
++        for file in files.flatten() {
++            let path = file.path();
++            let name = file.file_name().to_string_lossy().to_string();
++            let Some(start) = name.strip_suffix("-recording.mp4") else {
++                continue;
++            };
++            let Some(end) = file
++                .metadata()
++                .and_then(|m| m.modified())
++                .ok()
++                .map(|t| chrono::DateTime::<chrono::Local>::from(t).time())
++            else {
++                continue;
++            };
++            let target = path.with_file_name(format!("{start}-{}.mp4", end.format("%H%M%S")));
++            match std::fs::rename(&path, &target) {
++                Ok(()) => log::info!("Recording cut short, kept as {}", target.display()),
++                Err(e) => log::warn!("Cannot rename {}: {e}", path.display()),
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use chrono::NaiveTime;
++
++    #[test]
++    fn names_follow_the_eufy_bridge() {
++        let start = NaiveTime::from_hms_opt(13, 20, 5).unwrap();
++        let end = NaiveTime::from_hms_opt(13, 20, 41).unwrap();
++        assert_eq!(final_name(&start, &end), "132005-132041.mp4");
++        assert_eq!(partial_name(&start), "132005-recording.mp4");
++    }
++
++    #[test]
++    fn a_camera_name_stays_one_path_segment() {
++        assert_eq!(file_name("G330"), "G330");
++        assert_eq!(file_name("../etc"), ".._etc");
++        assert_eq!(file_name(".."), "_");
++    }
++
++    #[test]
++    fn partial_recordings_get_their_end_time() {
++        let dir = std::env::temp_dir().join(format!("neolink-record-{}", std::process::id()));
++        let day = dir.join("2026-11-10");
++        std::fs::create_dir_all(&day).unwrap();
++        std::fs::write(day.join("132005-recording.mp4"), b"x").unwrap();
++        std::fs::write(day.join("120000-120030.mp4"), b"x").unwrap();
++        finish_partial(&dir);
++        let mut names: Vec<String> = std::fs::read_dir(&day)
++            .unwrap()
++            .flatten()
++            .map(|f| f.file_name().to_string_lossy().to_string())
++            .collect();
++        names.sort();
++        std::fs::remove_dir_all(&dir).unwrap();
++        assert_eq!(names.len(), 2);
++        assert_eq!(names[0], "120000-120030.mp4");
++        assert!(names[1].starts_with("132005-") && names[1].ends_with(".mp4"));
++        assert!(!names[1].contains("recording"));
++    }
++}
+diff --git a/src/rtsp/factory.rs b/src/rtsp/factory.rs
+index 37c6114..e72124e 100644
+--- a/src/rtsp/factory.rs
++++ b/src/rtsp/factory.rs
+@@ -12,7 +12,11 @@ use neolink_core::{
+ };
+ use tokio::{sync::mpsc::channel as mpsc, task::JoinHandle};
+ 
+-use crate::{common::NeoInstance, rtsp::gst::NeoMediaFactory, AnyResult};
++use crate::{
++    common::NeoInstance,
++    rtsp::{gst::NeoMediaFactory, recorder::Recorder},
++    AnyResult,
++};
+ 
+ #[derive(Clone, Debug)]
+ pub enum AudioType {
+@@ -240,6 +244,15 @@ pub(super) async fn make_factory(
+                         // Send the pipeline back to the factory so it can start
+                         let _ = reply.send(element);
+ 
++                        // The live view is also written to a file when its camera records
++                        let recorder = stream_config.vid_type.and_then(|video| {
++                            Recorder::start(
++                                &name,
++                                video,
++                                matches!(stream_config.aud_type, Some(AudioType::Aac)),
++                            )
++                        });
++
+                         // Run blocking code on a seperate thread
+                         // This is not an async thread
+                         std::thread::spawn(move || {
+@@ -257,6 +270,7 @@ pub(super) async fn make_factory(
+                                     &mut vid_ts,
+                                     &mut aud_ts,
+                                     &stream_config,
++                                    recorder.as_ref(),
+                                 )?;
+                             }
+ 
+@@ -270,6 +284,7 @@ pub(super) async fn make_factory(
+                                     &mut vid_ts,
+                                     &mut aud_ts,
+                                     &stream_config,
++                                    recorder.as_ref(),
+                                 );
+                                 if let Err(r) = &r {
+                                     log::info!("Failed to send to source: {r:?}");
+@@ -310,6 +325,7 @@ struct SendState {
+     flushing_since: Option<Instant>,
+ }
+ 
++#[allow(clippy::too_many_arguments)]
+ fn send_to_sources(
+     data: BcMedia,
+     pools: &mut SendState,
+@@ -318,11 +334,15 @@ fn send_to_sources(
+     vid_ts: &mut u32,
+     aud_ts: &mut u32,
+     stream_config: &StreamConfig,
++    recorder: Option<&Recorder>,
+ ) -> AnyResult<()> {
+     // Update TS
+     match data {
+         BcMedia::Aac(aac) => {
+             let duration = aac.duration().expect("Could not calculate AAC duration");
++            if let Some(recorder) = recorder {
++                recorder.audio(&aac.data);
++            }
+             if let Some(aud_src) = aud_src.as_ref() {
+                 log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts as u64));
+                 send_to_appsrc(
+@@ -351,6 +371,9 @@ fn send_to_sources(
+         }
+         BcMedia::Iframe(BcMediaIframe { data, .. })
+         | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
++            if let Some(recorder) = recorder {
++                recorder.video(&data);
++            }
+             if let Some(vid_src) = vid_src.as_ref() {
+                 log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts as u64));
+                 send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts as u64), pools)?;
+diff --git a/src/rtsp/mod.rs b/src/rtsp/mod.rs
+index aa82d97..ad40c30 100644
+--- a/src/rtsp/mod.rs
++++ b/src/rtsp/mod.rs
+@@ -70,6 +70,7 @@ use tokio_util::sync::CancellationToken;
+ mod cmdline;
+ mod factory;
+ mod gst;
++mod recorder;
+ mod stream;
+ 
+ use crate::common::{NeoInstance, NeoReactor};
+diff --git a/src/rtsp/recorder.rs b/src/rtsp/recorder.rs
+new file mode 100644
+index 0000000..7e3d566
+--- /dev/null
++++ b/src/rtsp/recorder.rs
+@@ -0,0 +1,348 @@
++//! Writes a watched live view to an mp4 file (see `crate::record`)
++//!
++//! The frames are the camera's own: H.264/H.265 and AAC are muxed as they come, stamped by the
++//! clock on arrival, nothing is transcoded. The mp4 is fragmented every second, so a file cut short by a crash still plays;
++//! the file is named `HHMMSS-recording.mp4` while it is written and `HHMMSS-HHMMSS.mp4` once done.
++use anyhow::{anyhow, Context, Result};
++use chrono::Local;
++use gstreamer::{prelude::*, Caps, ClockTime, Element, ElementFactory, MessageView, Pipeline};
++use gstreamer_app::{AppSrc, AppStreamType};
++use neolink_core::bcmedia::model::VideoType;
++use std::{path::PathBuf, time::Duration};
++
++use crate::record;
++
++/// How long the muxer waits for frames of a track that is late or silent
++const MUX_LATENCY: Duration = Duration::from_millis(500);
++
++/// How long a finished recording may take to write its last fragment
++const FINISH_TIMEOUT: Duration = Duration::from_secs(5);
++
++pub(crate) struct Recorder {
++    camera: String,
++    pipeline: Pipeline,
++    video: AppSrc,
++    audio: Option<AppSrc>,
++    path: PathBuf,
++    start: chrono::DateTime<Local>,
++    finished: bool,
++}
++
++fn element(kind: &str) -> Result<Element> {
++    ElementFactory::make(kind)
++        .build()
++        .with_context(|| format!("GStreamer element {kind} is missing"))
++}
++
++fn appsrc(caps: Caps) -> Result<AppSrc> {
++    let src = element("appsrc")?
++        .dynamic_cast::<AppSrc>()
++        .map_err(|_| anyhow!("Cannot cast to appsrc"))?;
++    src.set_caps(Some(&caps));
++    // Live, stamped by the clock as the frames arrive: a camera's own frame times drift from its
++    // nominal rate, and its sound comes only now and then. A non-live mp4mux waited for the silent
++    // sound and wrote nothing after the first second.
++    src.set_is_live(true);
++    src.set_do_timestamp(true);
++    src.set_format(gstreamer::Format::Time);
++    src.set_stream_type(AppStreamType::Stream);
++    Ok(src)
++}
++
++impl Recorder {
++    /// Start recording `camera` when its recording is switched on and no other live view of it
++    /// records already. `aac`: the camera sends AAC sound (ADPCM is left out of the file).
++    pub(crate) fn start(camera: &str, video: VideoType, aac: bool) -> Option<Recorder> {
++        let dir = record::camera_dir(camera)?;
++        if !record::enabled(camera) || !record::claim(camera) {
++            return None;
++        }
++        match Self::open(camera, dir, video, aac) {
++            Ok(recorder) => {
++                log::info!(
++                    "{camera}: recording the live view to {}",
++                    recorder.path.display()
++                );
++                Some(recorder)
++            }
++            Err(e) => {
++                log::warn!("{camera}: cannot record the live view: {e:#}");
++                record::release(camera);
++                None
++            }
++        }
++    }
++
++    fn open(camera: &str, dir: PathBuf, video: VideoType, aac: bool) -> Result<Recorder> {
++        let start = Local::now();
++        let day = dir.join(start.format("%Y-%m-%d").to_string());
++        std::fs::create_dir_all(&day)
++            .with_context(|| format!("Cannot create {}", day.display()))?;
++        let path = day.join(record::partial_name(&start.time()));
++
++        let pipeline = Pipeline::new();
++        let (video_caps, parser) = match video {
++            VideoType::H264 => ("video/x-h264", "h264parse"),
++            VideoType::H265 => ("video/x-h265", "h265parse"),
++        };
++        let video_src = appsrc(
++            Caps::builder(video_caps)
++                .field("stream-format", "byte-stream")
++                .build(),
++        )?;
++        let video_parse = element(parser)?;
++        let video_queue = element("queue")?;
++        let mux = element("mp4mux")?;
++        mux.set_property("fragment-duration", 1000u32);
++        // How long the muxer waits for a late track before it writes the others
++        mux.set_property("latency", MUX_LATENCY.as_nanos() as u64);
++        let sink = element("filesink")?;
++        sink.set_property("location", path.to_string_lossy().to_string());
++
++        pipeline.add_many([
++            video_src.upcast_ref(),
++            &video_parse,
++            &video_queue,
++            &mux,
++            &sink,
++        ])?;
++        Element::link_many([
++            video_src.upcast_ref(),
++            &video_parse,
++            &video_queue,
++            &mux,
++            &sink,
++        ])?;
++
++        let audio = if aac {
++            let audio_src = appsrc(
++                Caps::builder("audio/mpeg")
++                    .field("mpegversion", 4i32)
++                    .field("stream-format", "adts")
++                    .build(),
++            )?;
++            let audio_parse = element("aacparse")?;
++            let audio_queue = element("queue")?;
++            pipeline.add_many([audio_src.upcast_ref(), &audio_parse, &audio_queue])?;
++            Element::link_many([audio_src.upcast_ref(), &audio_parse, &audio_queue, &mux])?;
++            Some(audio_src)
++        } else {
++            None
++        };
++
++        pipeline
++            .set_state(gstreamer::State::Playing)
++            .context("The recording pipeline does not start")?;
++        Ok(Recorder {
++            camera: camera.to_string(),
++            pipeline,
++            video: video_src,
++            audio,
++            path,
++            start,
++            finished: false,
++        })
++    }
++
++    /// A video frame (Annex B), as it arrives
++    pub(crate) fn video(&self, data: &[u8]) {
++        push(&self.video, data);
++    }
++
++    /// An ADTS AAC frame, as it arrives
++    pub(crate) fn audio(&self, data: &[u8]) {
++        if let Some(audio) = self.audio.as_ref() {
++            push(audio, data);
++        }
++    }
++
++    /// The file being written
++    #[allow(dead_code)]
++    pub(crate) fn path(&self) -> &PathBuf {
++        &self.path
++    }
++
++    /// End the file and give it its final name (dropping the recorder does the same)
++    #[cfg_attr(not(test), allow(dead_code))]
++    pub(crate) fn finish(mut self) -> Option<PathBuf> {
++        self.close()
++    }
++
++    fn close(&mut self) -> Option<PathBuf> {
++        if self.finished {
++            return None;
++        }
++        self.finished = true;
++        let _ = self.video.end_of_stream();
++        if let Some(audio) = self.audio.as_ref() {
++            let _ = audio.end_of_stream();
++        }
++        if let Some(bus) = self.pipeline.bus() {
++            let deadline = ClockTime::from_mseconds(FINISH_TIMEOUT.as_millis() as u64);
++            match bus.timed_pop_filtered(
++                deadline,
++                &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
++            ) {
++                Some(message) => {
++                    if let MessageView::Error(e) = message.view() {
++                        log::warn!(
++                            "{}: the recording ended with an error: {}",
++                            self.camera,
++                            e.error()
++                        );
++                    }
++                }
++                None => log::warn!("{}: the recording did not end in time", self.camera),
++            }
++        }
++        let _ = self.pipeline.set_state(gstreamer::State::Null);
++        record::release(&self.camera);
++
++        let target = self
++            .path
++            .with_file_name(record::final_name(&self.start.time(), &Local::now().time()));
++        match std::fs::rename(&self.path, &target) {
++            Ok(()) => {
++                log::info!("{}: recording kept as {}", self.camera, target.display());
++                Some(target)
++            }
++            Err(e) => {
++                log::warn!(
++                    "{}: cannot rename {}: {e}",
++                    self.camera,
++                    self.path.display()
++                );
++                None
++            }
++        }
++    }
++}
++
++impl Drop for Recorder {
++    fn drop(&mut self) {
++        self.close();
++    }
++}
++
++fn push(src: &AppSrc, data: &[u8]) {
++    // A full or stopped recording loses frames, never the live view
++    let _ = src.push_buffer(gstreamer::Buffer::from_slice(data.to_vec()));
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Synthetic camera frames: H.264 Annex B and ADTS AAC made by GStreamer itself
++    fn encoded(launch: &str, count: usize) -> Vec<Vec<u8>> {
++        let pipeline = gstreamer::parse::launch(launch)
++            .unwrap()
++            .downcast::<Pipeline>()
++            .unwrap();
++        let sink = pipeline
++            .by_name("out")
++            .unwrap()
++            .downcast::<gstreamer_app::AppSink>()
++            .unwrap();
++        pipeline.set_state(gstreamer::State::Playing).unwrap();
++        let frames = (0..count)
++            .filter_map(|_| sink.try_pull_sample(ClockTime::from_seconds(10)))
++            .map(|s| s.buffer().unwrap().map_readable().unwrap().to_vec())
++            .collect();
++        pipeline.set_state(gstreamer::State::Null).unwrap();
++        frames
++    }
++
++    /// The kinds of tracks qtdemux finds in an mp4 (video/x-h264, audio/mpeg, ...) and how many
++    /// video frames it holds
++    fn tracks(path: &std::path::Path) -> (Vec<String>, usize) {
++        let pipeline = Pipeline::new();
++        let source = element("filesrc").unwrap();
++        source.set_property("location", path.to_string_lossy().to_string());
++        let demux = element("qtdemux").unwrap();
++        pipeline.add_many([&source, &demux]).unwrap();
++        source.link(&demux).unwrap();
++        let found = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
++        let seen = found.clone();
++        let frames = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
++        let counted = frames.clone();
++        let bin = pipeline.clone();
++        demux.connect_pad_added(move |_, pad| {
++            let caps = pad.current_caps().unwrap();
++            let kind = caps.structure(0).unwrap().name().to_string();
++            if kind.starts_with("video/") {
++                let counted = counted.clone();
++                pad.add_probe(gstreamer::PadProbeType::BUFFER, move |_, _| {
++                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
++                    gstreamer::PadProbeReturn::Ok
++                });
++            }
++            seen.lock().unwrap().push(kind);
++            let sink = element("fakesink").unwrap();
++            bin.add(&sink).unwrap();
++            sink.sync_state_with_parent().unwrap();
++            pad.link(&sink.static_pad("sink").unwrap()).unwrap();
++        });
++        pipeline.set_state(gstreamer::State::Playing).unwrap();
++        let bus = pipeline.bus().unwrap();
++        bus.timed_pop_filtered(
++            ClockTime::from_seconds(10),
++            &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
++        );
++        pipeline.set_state(gstreamer::State::Null).unwrap();
++        let kinds = found.lock().unwrap().clone();
++        (kinds, frames.load(std::sync::atomic::Ordering::SeqCst))
++    }
++
++    #[test]
++    fn a_watched_live_view_becomes_a_named_mp4_with_sound() {
++        gstreamer::init().unwrap();
++        let dir = std::env::temp_dir().join(format!("neolink-recorder-{}", std::process::id()));
++        let switches = dir.join("switches");
++        record::init(&dir.to_string_lossy(), &switches.to_string_lossy());
++
++        // Switched off: nothing is recorded
++        assert!(Recorder::start("Garden", VideoType::H264, true).is_none());
++
++        record::set_enabled("Garden", true).unwrap();
++        let video = encoded(
++            "videotestsrc num-buffers=30 ! video/x-raw,width=320,height=240,framerate=15/1 \
++             ! x264enc key-int-max=15 ! video/x-h264,stream-format=byte-stream,alignment=au \
++             ! appsink name=out sync=false",
++            30,
++        );
++        let audio = encoded(
++            "audiotestsrc num-buffers=30 ! audio/x-raw,rate=16000,channels=1 ! avenc_aac \
++             ! aacparse ! audio/mpeg,stream-format=adts ! appsink name=out sync=false",
++            30,
++        );
++        let recorder = Recorder::start("Garden", VideoType::H264, true).expect("recording");
++        assert!(record::recording("Garden"));
++        // A second live view of the same camera does not record it twice
++        assert!(Recorder::start("Garden", VideoType::H264, true).is_none());
++        // As a camera sends them: in real time, and the sound stops after a few frames (Reolink
++        // cameras send sound only now and then) while the picture goes on.
++        for (i, frame) in video.iter().enumerate() {
++            recorder.video(frame);
++            if let Some(sound) = audio.get(i).filter(|_| i < 5) {
++                recorder.audio(sound);
++            }
++            std::thread::sleep(Duration::from_millis(66));
++        }
++        let path = recorder.finish().expect("a named file");
++        assert!(!record::recording("Garden"));
++
++        let name = path.file_name().unwrap().to_string_lossy().to_string();
++        assert!(
++            name.len() == "HHMMSS-HHMMSS.mp4".len() && name.ends_with(".mp4"),
++            "{}",
++            name
++        );
++        let (kinds, frames) = tracks(&path);
++        std::fs::remove_dir_all(&dir).unwrap();
++        assert!(kinds.contains(&"video/x-h264".to_string()), "{:?}", kinds);
++        assert!(kinds.contains(&"audio/mpeg".to_string()), "{:?}", kinds);
++        // The whole picture, not only the part with sound
++        assert!(frames >= 28, "{} of 30 video frames", frames);
++    }
++}
+diff --git a/src/ws/mod.rs b/src/ws/mod.rs
+index 0798964..63d9ee1 100644
+--- a/src/ws/mod.rs
++++ b/src/ws/mod.rs
+@@ -134,6 +134,10 @@ struct CameraState {
+     signal_value: Option<i32>,
+     /// 4G operator as MCC+MNC
+     mobile_operator: Option<u32>,
++    /// Watched live views are recorded to files (see `crate::record`); None without `record_dir`
++    record_live: Option<bool>,
++    /// A live view is being recorded right now
++    recording_live: bool,
+     /// Unix time (s) of the last change
+     updated: u64,
+ }
+@@ -177,6 +181,20 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
+     let cancel = CancellationToken::new();
+     let _cancel_drop = cancel.clone().drop_guard();
+     let mut set = JoinSet::<AnyResult<()>>::new();
++    if let Some(dir) = ws_config.record_dir.as_deref().filter(|d| !d.is_empty()) {
++        let switches = ws_config
++            .record_switches
++            .clone()
++            .unwrap_or_else(|| format!("{dir}/.switches"));
++        crate::record::init(dir, &switches);
++        for camera in config.borrow().cameras.iter() {
++            if let Some(dir) = crate::record::camera_dir(&camera.name) {
++                crate::record::finish_partial(&dir);
++            }
++        }
++        set.spawn(watch_recording(app.clone()));
++        log::info!("Live views of cameras switched on are recorded to {dir}");
++    }
+     set.spawn(watch_cameras(
+         app.clone(),
+         config.clone(),
+@@ -232,6 +250,30 @@ async fn cameras(app: &App) -> Vec<CameraState> {
+ }
+ 
+ /// Starts and stops per-camera watchers as cameras come and go in the config
++/// Follow the recording switches and the recordings into the cameras' state
++async fn watch_recording(app: App) -> AnyResult<()> {
++    let Some(mut changes) = crate::record::subscribe() else {
++        return Ok(());
++    };
++    loop {
++        match changes.recv().await {
++            Ok(name) => {
++                let (on, now) = (
++                    crate::record::enabled(&name),
++                    crate::record::recording(&name),
++                );
++                update(&app, &name, |s| {
++                    s.record_live = Some(on);
++                    s.recording_live = now;
++                })
++                .await;
++            }
++            Err(broadcast::error::RecvError::Lagged(_)) => continue,
++            Err(broadcast::error::RecvError::Closed) => return Ok(()),
++        }
++    }
++}
++
+ async fn watch_cameras(
+     app: App,
+     mut config: WatchReceiver<Config>,
+@@ -254,9 +296,12 @@ async fn watch_cameras(
+             }
+             let snapshot_at = app.snapshots.read().await.get(&name).map(|(t, _)| *t);
+             let event_snapshot_at = app.event_snapshots.read().await.get(&name).map(|(t, _)| *t);
++            let record_live =
++                crate::record::camera_dir(&name).map(|_| crate::record::enabled(&name));
+             update(&app, &name, |s| {
+                 s.snapshot_at = snapshot_at;
+                 s.event_snapshot_at = event_snapshot_at;
++                s.record_live = record_live;
+                 s.uid = uid.clone();
+                 s.motion_enabled = ws.enable_motion || push;
+                 if s.motion_enabled && s.motion.is_none() {
+@@ -1030,6 +1075,11 @@ async fn command(app: &App, request: &Request) -> AnyResult<Value> {
+             .await?;
+             update(app, name, |s| record_cfg_state(s, &r)).await;
+         }
++        "record_live" => {
++            // Local only: never wakes the camera
++            let on = arg_bool(args, "on")?;
++            crate::record::set_enabled(name, on)?;
++        }
+         "push" => {
+             let on = arg_bool(args, "on")?;
+             read(&camera, true, move |c| {
+-- 
+2.50.0
+

@@ -32,6 +32,8 @@ jq -r --argjson push "$(jq '.push' "${OPTIONS}")" --arg token "${WS_TOKEN}" --ar
     "enable_motion = \(.motion)",
     "motion_timeout = \(.motion_seconds)",
     "snapshot_dir = \"/data/snapshots\"",
+    "record_dir = \"/media/neolink\"",
+    "record_switches = \"/data/record\"",
     "",
     "[[users]]",
     "name = \($ruser | s)",
@@ -89,4 +91,21 @@ if [ "${LOG_LEVEL}" = "debug" ]; then
 else
   export RUST_LOG="${LOG_LEVEL}"
 fi
+# Recorded live views: files older than record_keep_days go once a day, when record_cleanup is on.
+cleanup_recordings() {
+    local keep
+    keep="$(jq -r '.record_keep_days // 90' "${OPTIONS}")"
+    while true; do
+        if [ -d /media/neolink ]; then
+            find /media/neolink -type f -name '*.mp4' -mtime "+${keep}" -delete 2>/dev/null || true
+            find /media/neolink -mindepth 2 -type d -empty -delete 2>/dev/null || true
+        fi
+        sleep 86400
+    done
+}
+if [ "$(jq -r '.record_cleanup // false' "${OPTIONS}")" = "true" ]; then
+    log "Recorded live views older than $(jq -r '.record_keep_days // 90' "${OPTIONS}") days are deleted"
+    cleanup_recordings &
+fi
+
 exec /usr/local/bin/neolink ws-rtsp --config "${CONFIG}"
