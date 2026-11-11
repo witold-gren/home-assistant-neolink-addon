@@ -1,5 +1,5 @@
 name: Neolink (Reolink battery & 4G cameras)
-version: "0.2.0"
+version: "0.3.0"
 slug: neolink
 description: Bridge for Reolink cameras without a local API (battery, 4G LTE) with a WebSocket API for the Neolink integration.
 url: https://github.com/witold-gren/home-assistant-neolink-addon
@@ -28,6 +28,7 @@ options:
   motion_seconds: 30
   record_cleanup: false
   record_keep_days: 90
+  sd_stream: main
   cameras:
     - name: G330
       uid: ""
@@ -44,6 +45,7 @@ schema:
   motion_seconds: int(5,600)
   record_cleanup: bool?
   record_keep_days: int(1,3650)?
+  sd_stream: list(main|sub)?
   cameras:
     - name: match(^[A-Za-z0-9_]+$)
       uid: str

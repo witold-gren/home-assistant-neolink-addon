@@ -20,6 +20,9 @@ configuration:
   record_keep_days:
     name: Keep recordings (days)
     description: How long recorded live views are kept when deleting old recordings is on.
+  sd_stream:
+    name: Copy SD card recordings from
+    description: "main: full quality; sub: the small stream, much less mobile data."
   cameras:
     name: Cameras
     description: >-

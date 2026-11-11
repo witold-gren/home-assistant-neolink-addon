@@ -31,8 +31,28 @@ app's Dockerfile:
 - talking through the speaker: `GET /talk/{camera}?rate=<Hz>` (WebSocket, token as for `/ws`) takes
   binary frames of PCM s16le mono at `rate` (8000-48000), encodes them with GStreamer to the camera's
   ADPCM (`TalkAbility`, e.g. DVI 16 kHz, blocks of `lengthPerEncoder / 2 + 4` bytes) and streams them
-  to the camera; the text `stop` or closing the socket ends it. The last message is `{"ok": true}` or
-  `{"ok": false, "error": "busy" | "no_speaker" | "unreachable" | "failed"}`; one talker per camera.
+  to the camera; the text `stop` or closing the socket ends it. On the way it sends
+  `{"state": "connecting"}` (at once) and `{"state": "connected"}` (the camera answered); the last
+  message is `{"ok": true}` or
+  `{"ok": false, "error": "busy" | "no_speaker" | "unreachable" | "failed"}`; one talker per camera;
+- the siren on and off: `siren` with `on` uses the manual mode of reolink_aio (`audioPlayInfo`
+  `playMode` 2, `onOff` 1/0, msg 263) and switches itself off after `seconds`; without `on` it sounds
+  once as upstream;
+- SD card recordings: search by the camera's calendar (`DayRecords` 142, a month at a time) and then
+  per day with `findAlarmVideo` (272/273/274, reolink_aio `search_vod_type`), or, on cameras that
+  answer it with 405 (a Go Plus), the older `FileInfoList` (14/15/16, host channel 250 in the
+  header); download by time (143, stopped by 144) or by replaying one file (5, message number 0,
+  stopped by 7, ending when the data goes quiet). The frames are muxed with their own times into
+  `<record_dir>/<camera>/<YYYY-MM-DD>/HHMMSS-HHMMSS.mp4` (`….mp4.part` while written; the codec is
+  read from the frames, as the card's main stream of a Go Plus is H.265 labelled H.264). Cover
+  thumbnails: `CoverPreview` (298), or else the first I-frame of a replay of the sub stream file,
+  as a JPEG in `<snapshot_dir>/sd/<camera>/`, served at `GET /sd_thumbnail/{camera}/{day}/{file}.jpg`.
+  The list is kept in `<snapshot_dir>/sd/<camera>/list.json`. Nothing on the card is deleted. The
+  wire formats of the older messages come from the decrypted Reolink app captures in
+  [nodelink-js](https://github.com/apocaliss92/nodelink-js) (MIT); `coverpreview-298-payload.bin`
+  in the core samples is one of them;
+- binary payloads with `encryptLen` keep their unencrypted rest (only the first `encryptLen` bytes
+  are AES; the rest was cut off).
 
 ## WebSocket protocol
 The client sends `{"id": 1, "command": "...", "camera": "Garden", "args": {...}}`, the bridge answers
@@ -43,7 +63,11 @@ The client sends `{"id": 1, "command": "...", "camera": "Garden", "args": {...}}
 | `list` | - | no |
 | `led`, `pir` | `on: bool` | yes |
 | `ir` | `state: on\|off\|auto` | yes |
-| `reboot`, `siren` | - | yes |
+| `reboot` | - | yes |
+| `siren` | - (sounds once), or `on: bool`, `seconds: 1-900` (default 30) | yes |
+| `sd_recordings` | the kept list at once (`updated`, `refreshing`, `error`, `recordings`: `file`, `start`, `end`, `kinds`, `size`, `local`, `downloading`, `thumbnail`); `refresh: true` searches the card in the background (`days`, default 365, or `hours`; `wait: true` waits for it), `thumbnails: [file]` fetches those covers first | with `refresh` |
+| `sd_auto` | `on: bool`: copy the newest recording 5 minutes after each motion notification (kept across restarts, off by default; state `sd_auto`) | no |
+| `sd_sync` | `files: [file]` (from the list), or `hours: int` (default 24) with `latest: bool`; copies one by one in the background, more can be asked meanwhile; progress in `sd_sync` (`pending`) | yes |
 | `battery`, `refresh` | - | yes |
 | `snapshot` | - (result `jpeg` in base64) | yes |
 | `wakeup` | `minutes: int` | yes |
@@ -64,5 +88,5 @@ card), `Net3g4gInfo` 255 (4G signal; the camera sends it by itself every few sec
 returns 405).
 
 Events: `{"type": "event", "event": "state", "camera": "...", "state": {...}}` on every change
-(connection, battery, LED/IR/PIR, motion, `record_live`, `recording_live`). The first message after connecting:
+(connection, battery, LED/IR/PIR, motion, `record_live`, `recording_live`, `siren_on`, `sd_sync`, `sd_auto`). The first message after connecting:
 `{"type": "hello", "version": "...", "cameras": [...]}`.

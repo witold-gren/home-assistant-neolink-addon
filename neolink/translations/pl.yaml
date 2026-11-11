@@ -20,6 +20,9 @@ configuration:
   record_keep_days:
     name: Przechowuj nagrania (dni)
     description: Jak długo trzymać nagrane podglądy, gdy usuwanie starych nagrań jest włączone.
+  sd_stream:
+    name: Kopiuj nagrania z karty SD ze strumienia
+    description: "main: pełna jakość; sub: mały strumień, dużo mniej danych komórkowych."
   cameras:
     name: Kamery
     description: >-

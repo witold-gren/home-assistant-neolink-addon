@@ -1,0 +1,70 @@
+From 1fd0d3ad93f63bcad7319df928cf4345ff0f4b74 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Witold=20Gre=C5=84?= <witold.gren@gmail.com>
+Date: Tue, 10 Nov 2026 19:17:58 +0100
+Subject: [PATCH] ws: talk reports connecting and connected states
+
+The client hears {"state": "connecting"} as soon as the socket opens and {"state": "connected"} once the camera answered TalkAbility and the encoder runs; neither carries ok, so a client ends a talk only on the outcome.
+---
+ src/ws/talk.rs | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/src/ws/talk.rs b/src/ws/talk.rs
+index a114572..1ef3fbd 100644
+--- a/src/ws/talk.rs
++++ b/src/ws/talk.rs
+@@ -3,7 +3,9 @@
+ //! The client sends binary frames of 16-bit little-endian mono PCM at `rate` (a browser's
+ //! microphone, e.g. 48000), then the text `stop`; closing the socket stops too. The sound is
+ //! resampled and encoded to the camera's own ADPCM (DVI) by GStreamer and streamed to the camera
+-//! as it comes. The last message is the outcome, `{"ok": true}` or
++//! as it comes. On the way the client hears `{"state": "connecting"}` (the camera is being woken)
++//! and `{"state": "connected"}` (the camera answered, the sound goes to it). The last message is
++//! the outcome, `{"ok": true}` or
+ //! `{"ok": false, "error": "busy" | "no_speaker" | "unreachable" | "failed"}`.
+ //! One talker per camera at a time: a second one gets `busy`.
+ use anyhow::{anyhow, Context, Result};
+@@ -35,6 +37,11 @@ pub(crate) fn talk_rate(rate: Option<u32>) -> Option<u32> {
+     rate.filter(|rate| RATES.contains(rate))
+ }
+ 
++/// A message on the way: `connecting` or `connected` (never ends the talk)
++pub(crate) fn state(state: &str) -> Value {
++    json!({"state": state})
++}
++
+ /// The outcome message of a talk
+ pub(crate) fn outcome(error: Option<&str>) -> Value {
+     match error {
+@@ -164,6 +171,9 @@ pub(crate) async fn serve(mut socket: WebSocket, camera: NeoInstance, name: Stri
+         .map(|mut t| t.insert(name.clone()))
+         .unwrap_or(false)
+     {
++        let _ = socket
++            .send(Message::Text(state("connecting").to_string()))
++            .await;
+         let error = talk(&mut socket, &camera, &name, rate).await.err();
+         if let Ok(mut t) = talking().lock() {
+             t.remove(&name);
+@@ -223,6 +233,9 @@ async fn talk(
+         .ok_or(TalkError::NoSpeaker)?;
+     let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = bounded(QUEUE_BLOCKS);
+     let encoder = Encoder::new(rate, camera_rate, block_align, tx).map_err(TalkError::Failed)?;
++    let _ = socket
++        .send(Message::Text(state("connected").to_string()))
++        .await;
+     log::info!("{name}: talking ({rate} Hz in, ADPCM {camera_rate} Hz to the camera)");
+     let mut playing = Box::pin(camera.run_task(move |cam| {
+         let rx = rx.clone();
+@@ -275,6 +288,9 @@ mod tests {
+ 
+     #[test]
+     fn outcomes_follow_the_dashboard_contract() {
++        // States carry no `ok`: the dashboard ends a talk only on a message with `ok`
++        assert_eq!(state("connecting"), json!({"state": "connecting"}));
++        assert!(state("connected").get("ok").is_none());
+         assert_eq!(outcome(None), json!({"ok": true}));
+         assert_eq!(
+             outcome(Some(TalkError::Busy.code())),
+-- 
+2.54.0 (Apple Git-157)
+

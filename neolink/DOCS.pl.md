@@ -40,6 +40,20 @@ nie ogląda, nic się nie nagrywa, więc nie kosztuje to dodatkowego transferu a
 zostają, dopóki nie włączysz `record_cleanup` (wtedy raz dziennie znikają starsze niż
 `record_keep_days`).
 
+## Nagrania z karty SD
+Nagrania, które kamera zapisuje na karcie SD (po wykryciu ruchu), można skopiować do tego samego
+folderu co nagrane podglądy, `/media/neolink/<kamera>/<RRRR-MM-DD>/GGMMSS-GGMMSS.mp4`, z nazwą od
+początku i końca zdarzenia według kamery, więc pojawiają się na tej samej osi czasu. Integracja
+Neolink ma przycisk **Synchronizuj nagrania** (ostatnie 7 dni: porównuje kartę z folderem i kopiuje
+to, czego brakuje) oraz akcję `neolink.sync_recordings` (`hours`, `latest: true` tylko dla
+najnowszego, np. kilka minut po powiadomieniu o ruchu). Przełącznik kamery **Automatycznie kopiuj
+nagrania** sam kopiuje najnowsze nagranie 5 minut po każdym powiadomieniu o ruchu (domyślnie
+wyłączony); dashboardy i tak pokazują nagrania z karty i pozwalają skopiować je ręcznie.
+
+Każde kopiowanie zużywa dane komórkowe i trzyma kamerę obudzoną: 30 s nagrania głównego strumienia
+Go Plus to około 13 MB i 2-3 minuty przez 4G. `sd_stream: sub` kopiuje mały strumień (ułamek danych,
+640×360). Pliki powstają jako `….mp4.part` i dostają nazwę dopiero w całości.
+
 ## Mówienie przez kamerę
 Integracja Neolink pozwala dashboardowi (np. Home Dashboard) mówić przez głośnik kamery: mikrofon
 telefonu lub tabletu idzie przez Home Assistant do tej aplikacji, która koduje dźwięk dla kamery.
@@ -69,6 +83,10 @@ Biblioteki sieciowe i protokół kamery pozostają na poziomie `info`. Potem wr�
 które odtwarzacz HLS w Home Assistant pomija, a go2rtc musiał je przekodować do WebRTC, zanim kamera
 się obudziła. Od 0.2.0 dźwięk idzie jako AAC i Opus. Jeśli dalej go nie ma, sprawdź w aplikacji
 Reolink, czy mikrofon kamery jest włączony.
+
+**Synchronizacja kończy się błędem „the download did not finish”** — przez 4G długie nagranie
+głównego strumienia może trwać dłużej niż 5 minut przewidzianych na jeden plik. Wybierz
+`sd_stream: sub` albo kopiuj tylko najnowsze nagranie po powiadomieniu o ruchu.
 
 ## Fork
 Co dodają łatki i jak wygląda protokół WebSocket (po angielsku): [FORK.md](FORK.md).

@@ -34,6 +34,7 @@ jq -r --argjson push "$(jq '.push' "${OPTIONS}")" --arg token "${WS_TOKEN}" --ar
     "snapshot_dir = \"/data/snapshots\"",
     "record_dir = \"/media/neolink\"",
     "record_switches = \"/data/record\"",
+    "sd_stream = \((.sd_stream // "main") | s)",
     "",
     "[[users]]",
     "name = \($ruser | s)",

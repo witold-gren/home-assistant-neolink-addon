@@ -39,6 +39,20 @@ of that camera is written, as it is watched and without transcoding, to Home Ass
 recorded while nobody watches, so it costs no extra data or battery. Old files stay until you switch
 on `record_cleanup` (then those older than `record_keep_days` go once a day).
 
+## SD card recordings
+The recordings the camera makes on its SD card (on motion) can be copied to the same folder as the
+recorded live views, `/media/neolink/<camera>/<YYYY-MM-DD>/HHMMSS-HHMMSS.mp4`, named by the
+camera's own start and end of the event, so they show on the same timeline. The Neolink integration
+has a **Sync recordings** button (the last 7 days: it compares the card with the folder and copies
+what is missing) and the `neolink.sync_recordings` action (`hours`, `latest: true` for only the
+newest one, e.g. a few minutes after a motion alert). The **Auto-copy recordings** switch of a
+camera copies the newest recording 5 minutes after each motion alert by itself (off by default);
+dashboards show the card's recordings and copy them by hand either way.
+
+Every copy costs mobile data and keeps the camera awake: a 30 s recording of the main stream of a
+Go Plus is about 13 MB and takes 2-3 minutes over 4G. `sd_stream: sub` copies the small stream
+instead (a fraction of the data, 640×360). Files are written as `….mp4.part` and renamed once whole.
+
 ## Talking through the camera
 The Neolink integration lets a dashboard (e.g. Home Dashboard) talk through the camera's speaker:
 the microphone of the phone or tablet goes over Home Assistant to this app, which encodes it for the
@@ -68,6 +82,10 @@ Network libraries and the camera protocol stay at `info`. Go back to `info` afte
 Assistant's HLS player drops and go2rtc had to transcode for WebRTC while the camera was still waking.
 From 0.2.0 the sound comes as AAC and Opus. If there is still none, check that the camera's microphone
 is on in the Reolink app.
+
+**Sync recordings fails with "the download did not finish"** — over 4G a long recording of the main
+stream can take more than the 5 minutes allowed for one file. Choose `sd_stream: sub`, or copy only
+the newest recording after a motion alert.
 
 ## The fork
 What the patches add and the WebSocket protocol: [FORK.md](FORK.md).
