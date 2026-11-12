@@ -1,0 +1,178 @@
+From 9b654ac773c04d28d6b8679f6ea2f586fab80009 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Witold=20Gre=C5=84?= <witold.gren@gmail.com>
+Date: Thu, 12 Nov 2026 11:27:50 +0100
+Subject: [PATCH] ws: SD card copies wait for a replay to let go, and tell why
+ they failed
+
+A cover replay was dropped after its first picture while its task still stopped and drained the camera's stream, so the card lock went free with the replay's subscription (message 5, number 0) still held, and the next copy failed with "Simultaneous subscription, Some(0)". The cover now waits for the replay to end (SdDownload::finish), and a download asks again for a subscription still held (40 x 250 ms).
+
+The newest recording copied after motion goes first in the queue, before older files asked for by hand. sd_recordings tells why the last copy of a file failed (copy_error), cleared when one succeeds.
+---
+ crates/core/src/bc_protocol/sdcard.rs | 45 ++++++++++++++++++++++++---
+ src/ws/sd.rs                          | 29 +++++++++++++++--
+ 2 files changed, 66 insertions(+), 8 deletions(-)
+
+diff --git a/crates/core/src/bc_protocol/sdcard.rs b/crates/core/src/bc_protocol/sdcard.rs
+index 4790136..2bd7f23 100644
+--- a/crates/core/src/bc_protocol/sdcard.rs
++++ b/crates/core/src/bc_protocol/sdcard.rs
+@@ -36,6 +36,9 @@ const HOST_CHANNEL: u8 = 250;
+ const REPLAY_IDLE: Duration = Duration::from_secs(15);
+ /// The longest wait for the first data of a download
+ const FIRST_DATA: Duration = Duration::from_secs(30);
++/// How often, and how long apart, a download asks again for a subscription still held
++const SUBSCRIBE_TRIES: u32 = 40;
++const SUBSCRIBE_WAIT: Duration = Duration::from_millis(250);
+ /// A cover picture is complete after this long without more of it
+ const COVER_IDLE: Duration = Duration::from_secs(3);
+ 
+@@ -83,6 +86,17 @@ impl SdDownload {
+     }
+ }
+ 
++impl SdDownload {
++    /// Stop the download and wait until the camera's stream is let go (its subscription free for
++    /// the next one)
++    pub async fn finish(mut self) {
++        self.abort_handle.cancel();
++        if let Some(handle) = self.handle.take() {
++            let _ = handle.await;
++        }
++    }
++}
++
+ impl Drop for SdDownload {
+     fn drop(&mut self) {
+         self.abort_handle.cancel();
+@@ -306,13 +320,23 @@ impl BcCamera {
+                 };
+                 log::debug!("No cover, replaying the start of {sub_id}");
+                 let mut replay = self.sd_replay(&sub_id, &recording.name, StreamKind::Sub);
++                let mut picture = Err(Error::Other("The replay held no picture"));
+                 while let Some(packet) = replay.next().await {
+-                    if let BcMedia::Iframe(frame) = packet? {
+-                        // Dropping the replay stops it
+-                        return Ok(frame);
++                    match packet {
++                        Ok(BcMedia::Iframe(frame)) => {
++                            picture = Ok(frame);
++                            break;
++                        }
++                        Ok(_) => {}
++                        Err(e) => {
++                            picture = Err(e);
++                            break;
++                        }
+                     }
+                 }
+-                Err(Error::Other("The replay held no picture"))
++                // The replay is stopped and its stream let go before the card is free again
++                replay.finish().await;
++                picture
+             }
+         }
+     }
+@@ -651,7 +675,18 @@ impl BcCamera {
+         let abort = abort_handle.clone();
+         let (tx, rx) = channel(100);
+         let handle = task::spawn(async move {
+-            let mut sub = connection.subscribe(msg_id, msg_num).await?;
++            // A replay always uses message number 0: one the camera has not let go of yet (an
++            // earlier replay still stopping) frees itself in a moment
++            let mut tries = 0;
++            let mut sub = loop {
++                match connection.subscribe(msg_id, msg_num).await {
++                    Err(Error::SimultaneousSubscription { .. }) if tries < SUBSCRIBE_TRIES => {
++                        tries += 1;
++                        tokio::time::sleep(SUBSCRIBE_WAIT).await;
++                    }
++                    other => break other?,
++                }
++            };
+             sub.send(request).await?;
+             // The answer is the first message with a code: data of an earlier replay the camera
+             // still sends (code 0) is left out
+diff --git a/src/ws/sd.rs b/src/ws/sd.rs
+index db47911..7932456 100644
+--- a/src/ws/sd.rs
++++ b/src/ws/sd.rs
+@@ -51,6 +51,8 @@ pub(super) struct SdShared {
+     wanted_covers: Mutex<HashMap<String, Vec<String>>>,
+     /// Cameras with an automatic copy waiting for its delay
+     auto_waiting: Mutex<HashSet<String>>,
++    /// Why the last copy of a file failed, by camera and file (cleared when one succeeds)
++    copy_errors: Mutex<HashMap<String, HashMap<String, String>>>,
+ }
+ 
+ #[derive(Clone, Default)]
+@@ -181,6 +183,12 @@ fn listing(app: &App, name: &str) -> Value {
+     let dir = crate::record::camera_dir(name);
+     let thumbs = thumbs_dir(app, name);
+     let queued = pending(app, name);
++    let errors = app
++        .sd
++        .copy_errors
++        .lock()
++        .map(|e| e.get(name).cloned().unwrap_or_default())
++        .unwrap_or_default();
+     let recordings: Vec<Value> = list
+         .recordings
+         .iter()
+@@ -195,6 +203,7 @@ fn listing(app: &App, name: &str) -> Value {
+                 "local": dir.as_ref().is_some_and(|d| d.join(&file).exists()),
+                 "downloading": queued.contains(&file),
+                 "thumbnail": thumbs.as_ref().is_some_and(|t| sdcard::thumbnail_path(t, v).exists()),
++                "copy_error": errors.get(&file),
+             })
+         })
+         .collect();
+@@ -427,14 +436,16 @@ pub(super) async fn sync(
+         }
+     };
+     let todo = sdcard::missing(&dir, &chosen);
+-    let queued = enqueue(app, name, todo);
++    // The newest recording after motion goes first, before older files asked for by hand
++    let first = args.get("latest").and_then(Value::as_bool).unwrap_or(false);
++    let queued = enqueue(app, name, todo, first);
+     log::info!("{name}: {queued} SD card recordings to copy");
+     start_worker(app.clone(), name.to_string(), camera.clone(), dir);
+     Ok(json!({"queued": queued, "pending": pending(app, name)}))
+ }
+ 
+ /// Add to the queue what is not in it yet; returns how many were added
+-fn enqueue(app: &App, name: &str, todo: Vec<SdRecording>) -> usize {
++fn enqueue(app: &App, name: &str, todo: Vec<SdRecording>, first: bool) -> usize {
+     let Ok(mut queues) = app.sd.queues.lock() else {
+         return 0;
+     };
+@@ -442,7 +453,12 @@ fn enqueue(app: &App, name: &str, todo: Vec<SdRecording>) -> usize {
+     let mut added = 0;
+     for video in todo {
+         if !queue.iter().any(|q| file_of(q) == file_of(&video)) {
+-            queue.push_back(video);
++            // Not before the one being copied now (the front)
++            if first && !queue.is_empty() {
++                queue.insert(1, video);
++            } else {
++                queue.push_back(video);
++            }
+             added += 1;
+         }
+     }
+@@ -485,6 +501,13 @@ fn start_worker(app: App, name: String, camera: NeoInstance, dir: PathBuf) {
+         while let Some(video) = next_in_queue(&app, &name) {
+             let result = sdcard::copy(&name, &camera, &dir, &video, app.sd_stream).await;
+             done_with(&app, &name, &video);
++            if let Ok(mut errors) = app.sd.copy_errors.lock() {
++                let errors = errors.entry(name.clone()).or_default();
++                match &result {
++                    Ok(_) => errors.remove(&file_of(&video)),
++                    Err(e) => errors.insert(file_of(&video), format!("{e:#}")),
++                };
++            }
+             let left = pending(&app, &name);
+             update(&app, &name, |s| {
+                 let sync = s.sd_sync.get_or_insert_with(Default::default);
+-- 
+2.54.0 (Apple Git-157)
+

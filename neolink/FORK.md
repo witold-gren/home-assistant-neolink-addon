@@ -65,7 +65,7 @@ The client sends `{"id": 1, "command": "...", "camera": "Garden", "args": {...}}
 | `ir` | `state: on\|off\|auto` | yes |
 | `reboot` | - | yes |
 | `siren` | - (sounds once), or `on: bool`, `seconds: 1-900` (default 30) | yes |
-| `sd_recordings` | the kept list at once (`updated`, `refreshing`, `error`, `recordings`: `file`, `start`, `end`, `kinds`, `size`, `local`, `downloading`, `thumbnail`); `refresh: true` searches the card in the background (`days`, default 365, or `hours`; `wait: true` waits for it), `thumbnails: [file]` fetches those covers first | with `refresh` |
+| `sd_recordings` | the kept list at once (`updated`, `refreshing`, `error`, `recordings`: `file`, `start`, `end`, `kinds`, `size`, `local`, `downloading`, `copy_error`, `thumbnail`); `refresh: true` searches the card in the background (`days`, default 365, or `hours`; `wait: true` waits for it), `thumbnails: [file]` fetches those covers first | with `refresh` |
 | `sd_auto` | `on: bool`: copy the newest recording 5 minutes after each motion notification (kept across restarts, off by default; state `sd_auto`) | no |
 | `sd_sync` | `files: [file]` (from the list), or `hours: int` (default 24) with `latest: bool`; copies one by one in the background, more can be asked meanwhile; progress in `sd_sync` (`pending`) | yes |
 | `battery`, `refresh` | - | yes |

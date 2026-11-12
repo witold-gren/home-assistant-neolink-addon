@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1
+- SD card copies no longer fail with "Simultaneous subscription, Some(0)": fetching a cover now
+  waits until its replay has let go of the camera's stream before the next copy starts.
+- The newest recording copied after motion goes first in the queue, before older ones asked for by
+  hand.
+- The list of the card tells why the last copy of a recording failed (`copy_error`), so a dashboard
+  can show it.
+
 ## 0.3.0
 - Recordings on the SD card copied to Home Assistant: the integration's "Sync recordings" button
   (or the `neolink.sync_recordings` action) searches the card, compares it with
