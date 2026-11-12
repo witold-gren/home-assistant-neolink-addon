@@ -94,5 +94,10 @@ klatkę bez końca i trzymał połączenie z kamerą (w dzienniku `Buffer full o
 `Connection Lost` co 30 minut). Od 0.3.2 taki podgląd kończy się po 20 s bez klatki i kamera wraca do
 uśpienia. Plik usuń ręcznie.
 
+**Kopiowanie nagrania z karty SD trwa minuty** — przez 4G (przekaźnik Reolink) główny strumień
+płynie z prędkością ok. 75 KB/s: 37-sekundowe nagranie (16 MB) kopiuje się ok. 3,5 minuty, a
+nagrania kopiują się po kolei. Wybierz `sd_stream: sub`, żeby kopie trwały sekundy (mniejszy obraz).
+Do wersji 0.3.2 otwarcie listy najpierw przeszukiwało też całą kartę (kolejne 3,5 minuty).
+
 ## Fork
 Co dodają łatki i jak wygląda protokół WebSocket (po angielsku): [FORK.md](FORK.md).

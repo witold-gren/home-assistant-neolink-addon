@@ -1,0 +1,260 @@
+From e8a00886e4d6a4d9ab1bcb058428b6a9edda8bd8 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Witold=20Gre=C5=84?= <witold.gren@gmail.com>
+Date: Thu, 12 Nov 2026 12:58:21 +0100
+Subject: [PATCH] ws: refresh the SD card list with only what is new since the
+ last search
+
+Each time a dashboard opened the list, the whole card was searched again, a year of days:
+3.5 minutes with a battery camera awake over 4G, and copies asked for meanwhile waited
+behind it. Within a day of the last full search a refresh now asks only for the time since
+the last search and keeps the rest of the list; a full search still runs once a day.
+---
+ src/ws/sd.rs | 160 +++++++++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 144 insertions(+), 16 deletions(-)
+
+diff --git a/src/ws/sd.rs b/src/ws/sd.rs
+index 7932456..c7aa2bd 100644
+--- a/src/ws/sd.rs
++++ b/src/ws/sd.rs
+@@ -1,7 +1,8 @@
+ //! The SD card over the WebSocket: the list of its recordings and copies of them
+ //!
+ //! - `sd_recordings`: the list kept from the last search, at once; `refresh: true` searches the
+-//!   card again in the background (`days`, default 365, by its calendar) and then fetches the
++//!   card again in the background (`days`, default 365, by its calendar; within a day of the last
++//!   full search only the days since the last search, the rest of the list is kept) and then fetches the
+ //!   cover thumbnails of the newest recordings (`GET /sd_thumbnail/{camera}/{day}/{HHMMSS-HHMMSS}.jpg`);
+ //!   `thumbnails: [files]` asks for the covers of older ones (e.g. those a client shows).
+ //! - `sd_sync`: copies chosen recordings (`files`, as the list names them) or those of the last
+@@ -21,7 +22,7 @@ use axum::{
+     http::{header, HeaderMap, StatusCode},
+     response::{IntoResponse, Response},
+ };
+-use neolink_core::bc_protocol::SdRecording;
++use neolink_core::{bc::xml::SdTime, bc_protocol::SdRecording};
+ use serde_json::{json, Value};
+ use std::{
+     collections::{HashMap, HashSet, VecDeque},
+@@ -31,6 +32,11 @@ use std::{
+ 
+ /// How far back a refresh searches when no `days` are given
+ const LIST_DAYS: u64 = 365;
++/// A full search (a year of days, minutes over 4G with the camera awake) at most this often;
++/// between them a refresh asks the card only for what is new since the last search
++const FULL_SEARCH_EVERY: u64 = 24 * 3600;
++/// A new search starts this much before the last one: a recording going on then is complete now
++const SEARCH_OVERLAP: u64 = 3600;
+ /// Thumbnails stop after this many covers in a row could not be fetched
+ const COVER_FAILURES: usize = 3;
+ /// How long after a motion notification the newest recording is copied (`sd_auto`): the camera
+@@ -59,6 +65,8 @@ pub(super) struct SdShared {
+ struct CardList {
+     /// Unix time (s) of the search
+     updated: Option<u64>,
++    /// Unix time (s) of the last search of the whole card
++    full: Option<u64>,
+     recordings: Vec<SdRecording>,
+     error: Option<String>,
+ }
+@@ -80,7 +88,8 @@ fn save_list(app: &App, name: &str, list: &CardList) {
+                    "id": v.id, "size": v.size, "sub_id": v.sub_id})
+         })
+         .collect();
+-    let text = json!({"updated": list.updated, "recordings": recordings}).to_string();
++    let text =
++        json!({"updated": list.updated, "full": list.full, "recordings": recordings}).to_string();
+     if let Some(dir) = path.parent() {
+         let _ = std::fs::create_dir_all(dir);
+     }
+@@ -110,6 +119,7 @@ fn load_list(app: &App, name: &str) -> Option<CardList> {
+         .collect();
+     Some(CardList {
+         updated: value.get("updated").and_then(Value::as_u64),
++        full: value.get("full").and_then(Value::as_u64),
+         recordings,
+         error: None,
+     })
+@@ -235,19 +245,20 @@ pub(super) async fn recordings(
+         thumbnails(app.clone(), name.to_string(), camera.clone());
+     }
+     if args.get("refresh").and_then(Value::as_bool).unwrap_or(false) {
+-        let range = match args.get("hours").and_then(Value::as_u64) {
+-            Some(hours) => sdcard::last_hours(hours.clamp(1, 24 * 3650)),
+-            None => sdcard::last_hours(
+-                args.get("days")
+-                    .and_then(Value::as_u64)
+-                    .unwrap_or(LIST_DAYS)
+-                    .clamp(1, 3650)
+-                    * 24,
+-            ),
++        let hours = match args.get("hours").and_then(Value::as_u64) {
++            Some(hours) => hours.clamp(1, 24 * 3650),
++            None => args
++                .get("days")
++                .and_then(Value::as_u64)
++                .unwrap_or(LIST_DAYS)
++                .clamp(1, 3650)
++                * 24,
+         };
++        let asked = sdcard::last_hours(hours);
++        let (range, full) = search_range(&list_of(app, name), asked, hours >= LIST_DAYS * 24, now());
+         let wait = args.get("wait").and_then(Value::as_bool).unwrap_or(false);
+         if claim(&app.sd.refreshing, name) {
+-            let job = refresh(app.clone(), name.to_string(), camera.clone(), range);
++            let job = refresh(app.clone(), name.to_string(), camera.clone(), range, full);
+             if wait {
+                 job.await;
+             } else {
+@@ -262,17 +273,30 @@ async fn refresh(
+     app: App,
+     name: String,
+     camera: NeoInstance,
+-    range: (neolink_core::bc::xml::SdTime, neolink_core::bc::xml::SdTime),
++    range: (SdTime, SdTime),
++    full: bool,
+ ) {
+     let found = sdcard::recordings(&name, &camera, range, app.sd_stream).await;
++    // The kept list, also when it is only on disk
++    let kept = list_of(&app, &name);
+     if let Ok(mut lists) = app.sd.lists.lock() {
+         let list = lists.entry(name.clone()).or_default();
+         match found {
+             Ok(found) => {
+-                log::info!("{name}: {} recordings on the SD card", found.len());
++                let recordings = if full {
++                    found
++                } else {
++                    merge(&kept.recordings, found, &range.0)
++                };
++                log::info!(
++                    "{name}: {} recordings on the SD card{}",
++                    recordings.len(),
++                    if full { "" } else { " (searched since the last time)" }
++                );
+                 *list = CardList {
+                     updated: Some(now()),
+-                    recordings: found,
++                    full: if full { Some(now()) } else { kept.full },
++                    recordings,
+                     error: None,
+                 };
+                 save_list(&app, &name, list);
+@@ -287,6 +311,49 @@ async fn refresh(
+     thumbnails(app, name, camera);
+ }
+ 
++/// What a refresh asks the card for, and whether that is a full search. Within
++/// `FULL_SEARCH_EVERY` of the last full search only the time since the last search (less
++/// `SEARCH_OVERLAP`) is asked; the kept list stands for the rest. `whole`: the asked range is the
++/// whole card.
++fn search_range(
++    list: &CardList,
++    asked: (SdTime, SdTime),
++    whole: bool,
++    now: u64,
++) -> ((SdTime, SdTime), bool) {
++    let since = match (list.updated, list.full) {
++        (Some(updated), Some(full)) if now.saturating_sub(full) < FULL_SEARCH_EVERY => {
++            local_time(updated.saturating_sub(SEARCH_OVERLAP))
++        }
++        _ => None,
++    };
++    match since {
++        Some(since) if since > asked.0 => ((since, asked.1), false),
++        _ => (asked, whole),
++    }
++}
++
++fn local_time(unix: u64) -> Option<SdTime> {
++    use chrono::TimeZone;
++    chrono::Local
++        .timestamp_opt(unix as i64, 0)
++        .single()
++        .map(|t| sdcard::sd_time(&t.naive_local()))
++}
++
++/// The kept recordings from before `from` and those just found, in order, each once
++fn merge(kept: &[SdRecording], found: Vec<SdRecording>, from: &SdTime) -> Vec<SdRecording> {
++    let new: HashSet<String> = found.iter().map(file_of).collect();
++    let mut all: Vec<SdRecording> = kept
++        .iter()
++        .filter(|v| v.start < *from && !new.contains(&file_of(v)))
++        .cloned()
++        .chain(found)
++        .collect();
++    all.sort_by(|a, b| (a.start, &a.name).cmp(&(b.start, &b.name)));
++    all
++}
++
+ /// Fetch the covers the list lacks, newest first, in the background
+ fn thumbnails(app: App, name: String, camera: NeoInstance) {
+     let Some(thumbs) = thumbs_dir(&app, &name) else {
+@@ -611,4 +678,65 @@ mod tests {
+         };
+         assert_eq!(iso(&t), "2026-10-15T12:05:09");
+     }
++
++    fn at(day: u8, hour: u8) -> SdTime {
++        SdTime {
++            year: 2026,
++            month: 11,
++            day,
++            hour,
++            minute: 0,
++            second: 0,
++        }
++    }
++
++    fn video(day: u8, hour: u8) -> SdRecording {
++        SdRecording {
++            start: at(day, hour),
++            end: SdTime {
++                minute: 1,
++                ..at(day, hour)
++            },
++            kinds: "pir".into(),
++            name: format!("{day}-{hour}"),
++            id: None,
++            size: None,
++            sub_id: None,
++        }
++    }
++
++    #[test]
++    fn a_refresh_soon_after_a_full_search_asks_only_for_what_is_new() {
++        let now = 2_000_000_000;
++        let asked = (at(1, 0), at(12, 13));
++        // Never searched in full: the whole card
++        assert_eq!(search_range(&CardList::default(), asked, true, now), (asked, true));
++        let list = CardList {
++            updated: Some(now - 600),
++            full: Some(now - 3600),
++            ..Default::default()
++        };
++        let (range, full) = search_range(&list, asked, true, now);
++        assert!(!full);
++        assert_eq!(range.0, local_time(now - 600 - SEARCH_OVERLAP).unwrap());
++        assert_eq!(range.1, asked.1);
++        // A day after the full search: the whole card again (recordings the card overwrote go)
++        let old = CardList {
++            full: Some(now - FULL_SEARCH_EVERY),
++            ..list.clone()
++        };
++        assert_eq!(search_range(&old, asked, true, now), (asked, true));
++        // Asked for less than what is new: as asked, not a full search
++        let narrow = (local_time(now - 60).unwrap(), asked.1);
++        assert_eq!(search_range(&list, narrow, false, now), (narrow, false));
++    }
++
++    #[test]
++    fn the_new_part_of_the_card_joins_the_kept_list() {
++        let kept = vec![video(10, 8), video(12, 9), video(12, 11)];
++        // The search since 12th 10:00 found the 11:00 one again and a new one
++        let merged = merge(&kept, vec![video(12, 11), video(12, 12)], &at(12, 10));
++        let names: Vec<&str> = merged.iter().map(|v| v.name.as_str()).collect();
++        assert_eq!(names, ["10-8", "12-9", "12-11", "12-12"]);
++    }
+ }
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.3
+- Opening the list of the SD card no longer searches the whole card each time. Within a day of
+  the last full search only what is new since the last search is asked for (seconds instead of
+  minutes over 4G, with the camera awake), and copies asked for meanwhile no longer wait minutes
+  behind the search. A full search still runs once a day, so recordings the card overwrote leave
+  the list.
+
 ## 0.3.2
 - A live view whose camera stops sending now ends after 20 seconds and lets go of the camera. Before,
   it waited for the next frame forever and kept the camera's session open: a battery camera stayed

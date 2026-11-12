@@ -93,5 +93,10 @@ the camera connected (the log shows `Buffer full on vidsrc ...`, then only `Conn
 minutes). From 0.3.2 such a live view ends after 20 s without a frame and the camera goes back to
 sleep. Delete the file by hand.
 
+**Copying a recording from the SD card takes minutes** — over 4G (Reolink's relay) the main stream
+comes at about 75 KB/s: a 37-second recording (16 MB) takes about 3.5 minutes, and recordings are
+copied one after another. Choose `sd_stream: sub` for copies in seconds (a smaller picture). Up to
+0.3.2 opening the list also searched the whole card first (another 3.5 minutes).
+
 ## The fork
 What the patches add and the WebSocket protocol: [FORK.md](FORK.md).
