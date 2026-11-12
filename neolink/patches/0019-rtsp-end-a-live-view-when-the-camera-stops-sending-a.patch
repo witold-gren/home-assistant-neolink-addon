@@ -1,0 +1,202 @@
+From efbc5b7df5bfa02f51a562ad185ca8d389d734ae Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Witold=20Gre=C5=84?= <witold.gren@gmail.com>
+Date: Thu, 12 Nov 2026 11:37:16 +0100
+Subject: [PATCH] rtsp: end a live view when the camera stops sending, and
+ measure recordings by their frames
+
+A camera that stopped sending after a few frames left the live view waiting forever for the
+next one, and the waiting stream kept the camera's session open: a battery camera stayed
+awake for 90 minutes, reconnecting every half hour, and the recorder kept a file of 0.4 s
+named as 90 minutes. A live view now ends after 20 s without a frame (not when paused on
+motion), and a recording's length and end come from its first and last frame.
+---
+ src/rtsp/factory.rs  | 60 +++++++++++++++++++++++++++++++++++++++++---
+ src/rtsp/recorder.rs | 18 ++++++++++---
+ 2 files changed, 71 insertions(+), 7 deletions(-)
+
+diff --git a/src/rtsp/factory.rs b/src/rtsp/factory.rs
+index e72124e..1d61df6 100644
+--- a/src/rtsp/factory.rs
++++ b/src/rtsp/factory.rs
+@@ -183,7 +183,9 @@ pub(super) async fn make_factory(
+                         let mut frame_count = 0usize;
+ 
+                         let mut stream_config = StreamConfig::new(&camera, stream).await?;
+-                        while let Some(media) = media_rx.recv().await {
++                        while let Ok(Some(media)) =
++                            tokio::time::timeout(MEDIA_IDLE_LIMIT, media_rx.recv()).await
++                        {
+                             stream_config.update_from_media(&media);
+                             buffer.push(media);
+                             if frame_count > 10
+@@ -255,6 +257,9 @@ pub(super) async fn make_factory(
+ 
+                         // Run blocking code on a seperate thread
+                         // This is not an async thread
++                        let runtime = tokio::runtime::Handle::current();
++                        // Paused on motion, a camera is silent on purpose
++                        let idle_limit = (!config.pause.on_motion).then_some(MEDIA_IDLE_LIMIT);
+                         std::thread::spawn(move || {
+                             let mut aud_ts = 0u32;
+                             let mut vid_ts = 0u32;
+@@ -275,7 +280,9 @@ pub(super) async fn make_factory(
+                             }
+ 
+                             log::trace!("{name}::{stream}: Sending new frames");
+-                            while let Some(data) = media_rx.blocking_recv() {
++                            while let Some(data) =
++                                next_media(&runtime, &mut media_rx, idle_limit)
++                            {
+                                 let r = send_to_sources(
+                                     data,
+                                     &mut pools,
+@@ -291,7 +298,12 @@ pub(super) async fn make_factory(
+                                 }
+                                 r?;
+                             }
+-                            log::trace!("All media recieved");
++                            // Silent camera: end the client's stream too, the camera's session
++                            // was let go with the receiver
++                            for src in vid_src.iter().chain(aud_src.iter()) {
++                                let _ = src.end_of_stream();
++                            }
++                            log::info!("{name}::{stream}: live view ended");
+                             AnyResult::Ok(())
+                         });
+                         AnyResult::Ok(())
+@@ -314,6 +326,30 @@ pub(super) async fn make_factory(
+     Ok((factory, thread))
+ }
+ 
++/// How long a live view waits for the camera's next frame. A camera that stops sending (a
++/// stalled relay, a camera falling asleep) left the stream waiting forever, and the waiting
++/// stream kept the camera's session open: a battery camera stayed awake for hours.
++const MEDIA_IDLE_LIMIT: Duration = Duration::from_secs(20);
++
++/// The camera's next frame, or None when the camera has ended the stream or sent nothing for
++/// `limit`
++fn next_media(
++    runtime: &tokio::runtime::Handle,
++    media_rx: &mut tokio::sync::mpsc::Receiver<BcMedia>,
++    limit: Option<Duration>,
++) -> Option<BcMedia> {
++    let Some(limit) = limit else {
++        return media_rx.blocking_recv();
++    };
++    match runtime.block_on(async { tokio::time::timeout(limit, media_rx.recv()).await }) {
++        Ok(media) => media,
++        Err(_) => {
++            log::info!("No frame from the camera for {limit:?}, ending the live view");
++            None
++        }
++    }
++}
++
+ /// How long an appsrc may refuse buffers as flushing before the stream is dropped. A client
+ /// that left without a TEARDOWN leaves its pipeline flushing forever, and a stream that keeps
+ /// running for nobody holds the camera awake (and drains a battery camera).
+@@ -1056,6 +1092,24 @@ mod tests {
+         sink
+     }
+ 
++    #[test]
++    fn a_silent_camera_ends_the_live_view() {
++        let runtime = tokio::runtime::Runtime::new().unwrap();
++        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
++        runtime
++            .block_on(tx.send(BcMedia::Aac(neolink_core::bcmedia::model::BcMediaAac {
++                data: vec![0xff],
++            })))
++            .unwrap();
++        let limit = Duration::from_millis(200);
++        assert!(next_media(runtime.handle(), &mut rx, Some(limit)).is_some());
++        // The sender is still there (the camera is connected) but sends nothing
++        let waited = Instant::now();
++        assert!(next_media(runtime.handle(), &mut rx, Some(limit)).is_none());
++        assert!(waited.elapsed() >= limit);
++        drop(tx);
++    }
++
+     #[test]
+     fn decoded_audio_is_paid_as_aac_and_opus() {
+         gstreamer::init().unwrap();
+diff --git a/src/rtsp/recorder.rs b/src/rtsp/recorder.rs
+index 50269d3..6300b60 100644
+--- a/src/rtsp/recorder.rs
++++ b/src/rtsp/recorder.rs
+@@ -8,7 +8,7 @@ use chrono::Local;
+ use gstreamer::{prelude::*, Caps, ClockTime, Element, ElementFactory, MessageView, Pipeline};
+ use gstreamer_app::{AppSrc, AppStreamType};
+ use neolink_core::bcmedia::model::VideoType;
+-use std::{path::PathBuf, time::Duration};
++use std::{cell::Cell, path::PathBuf, time::Duration};
+ 
+ use crate::record;
+ 
+@@ -19,7 +19,8 @@ const MUX_LATENCY: Duration = Duration::from_millis(500);
+ const FINISH_TIMEOUT: Duration = Duration::from_secs(5);
+ 
+ /// A live view shorter than this is not kept: Home Assistant checks the stream and players open
+-/// it for a moment, which left files of a fraction of a second
++/// it for a moment, which left files of a fraction of a second. The length is that of its
++/// pictures: a camera that stopped sending left a file of 0.4 s named as 90 minutes.
+ const MIN_LENGTH: Duration = Duration::from_secs(1);
+ 
+ pub(crate) struct Recorder {
+@@ -29,6 +30,8 @@ pub(crate) struct Recorder {
+     audio: Option<AppSrc>,
+     path: PathBuf,
+     start: chrono::DateTime<Local>,
++    /// When the first and the last video frame came
++    frames: Cell<Option<(chrono::DateTime<Local>, chrono::DateTime<Local>)>>,
+     finished: bool,
+ }
+ 
+@@ -144,12 +147,16 @@ impl Recorder {
+             audio,
+             path,
+             start,
++            frames: Cell::new(None),
+             finished: false,
+         })
+     }
+ 
+     /// A video frame (Annex B), as it arrives
+     pub(crate) fn video(&self, data: &[u8]) {
++        let now = Local::now();
++        let first = self.frames.get().map_or(now, |(first, _)| first);
++        self.frames.set(Some((first, now)));
+         push(&self.video, data);
+     }
+ 
+@@ -202,7 +209,8 @@ impl Recorder {
+         let _ = self.pipeline.set_state(gstreamer::State::Null);
+         record::release(&self.camera);
+ 
+-        let length = (Local::now() - self.start).to_std().unwrap_or_default();
++        let (first, last) = self.frames.get().unwrap_or((self.start, self.start));
++        let length = (last - first).to_std().unwrap_or_default();
+         if length < MIN_LENGTH {
+             log::info!(
+                 "{}: live view of {:.1} s not kept",
+@@ -214,7 +222,7 @@ impl Recorder {
+         }
+         let target = self
+             .path
+-            .with_file_name(record::final_name(&self.start.time(), &Local::now().time()));
++            .with_file_name(record::final_name(&self.start.time(), &last.time()));
+         match std::fs::rename(&self.path, &target) {
+             Ok(()) => {
+                 log::info!("{}: recording kept as {}", self.camera, target.display());
+@@ -380,6 +388,8 @@ pub(crate) mod tests {
+         for frame in &video {
+             recorder.video(frame);
+         }
++        // Its few frames came at once: waiting for more that never come does not make it longer
++        std::thread::sleep(Duration::from_millis(1500));
+         assert!(recorder.finish().is_none());
+         let left = std::fs::read_dir(dir.join("Gate"))
+             .map(|days| {
+-- 
+2.54.0 (Apple Git-157)
+

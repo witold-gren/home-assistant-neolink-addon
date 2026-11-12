@@ -88,5 +88,11 @@ Reolink, czy mikrofon kamery jest włączony.
 głównego strumienia może trwać dłużej niż 5 minut przewidzianych na jeden plik. Wybierz
 `sd_stream: sub` albo kopiuj tylko najnowsze nagranie po powiadomieniu o ruchu.
 
+**Nagranie podglądu jest długie, a pokazuje tylko chwilę, i bateria szybko się rozładowała** — do
+wersji 0.3.1 podgląd, którego kamera po kilku klatkach przestała wysyłać obraz, czekał na następną
+klatkę bez końca i trzymał połączenie z kamerą (w dzienniku `Buffer full on vidsrc ...`, potem tylko
+`Connection Lost` co 30 minut). Od 0.3.2 taki podgląd kończy się po 20 s bez klatki i kamera wraca do
+uśpienia. Plik usuń ręcznie.
+
 ## Fork
 Co dodają łatki i jak wygląda protokół WebSocket (po angielsku): [FORK.md](FORK.md).

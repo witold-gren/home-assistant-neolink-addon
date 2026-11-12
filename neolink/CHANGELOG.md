@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.2
+- A live view whose camera stops sending now ends after 20 seconds and lets go of the camera. Before,
+  it waited for the next frame forever and kept the camera's session open: a battery camera stayed
+  awake (reconnecting every 30 minutes) and drained its battery, and the recorded live view came out
+  as a "90 minute" file holding less than a second of picture.
+- A recorded live view's length and end time come from its first and last frame, not from when it
+  was closed: a live view with less than a second of picture is not kept.
+
 ## 0.3.1
 - SD card copies no longer fail with "Simultaneous subscription, Some(0)": fetching a cover now
   waits until its replay has let go of the camera's stream before the next copy starts.

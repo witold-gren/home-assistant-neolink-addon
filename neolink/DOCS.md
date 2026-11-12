@@ -87,5 +87,11 @@ is on in the Reolink app.
 stream can take more than the 5 minutes allowed for one file. Choose `sd_stream: sub`, or copy only
 the newest recording after a motion alert.
 
+**A recorded live view is long but shows only a moment, and the battery ran down** — up to 0.3.1 a
+live view whose camera stopped sending after a few frames waited for the next one forever and kept
+the camera connected (the log shows `Buffer full on vidsrc ...`, then only `Connection Lost` every 30
+minutes). From 0.3.2 such a live view ends after 20 s without a frame and the camera goes back to
+sleep. Delete the file by hand.
+
 ## The fork
 What the patches add and the WebSocket protocol: [FORK.md](FORK.md).
