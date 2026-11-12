@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.4
+- A live view whose camera stops sending now really lets the camera go. 0.3.2 ended the live view
+  itself, but the task reading the camera's stream kept waiting for data and held the camera
+  connected (and connected it again after each lost connection). It now ends when nobody listens
+  any more or after 20 seconds without data, so the camera sleeps 30 seconds later.
+
 ## 0.3.3
 - Opening the list of the SD card no longer searches the whole card each time. Within a day of
   the last full search only what is new since the last search is asked for (seconds instead of

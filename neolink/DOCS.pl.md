@@ -91,8 +91,8 @@ głównego strumienia może trwać dłużej niż 5 minut przewidzianych na jeden
 **Nagranie podglądu jest długie, a pokazuje tylko chwilę, i bateria szybko się rozładowała** — do
 wersji 0.3.1 podgląd, którego kamera po kilku klatkach przestała wysyłać obraz, czekał na następną
 klatkę bez końca i trzymał połączenie z kamerą (w dzienniku `Buffer full on vidsrc ...`, potem tylko
-`Connection Lost` co 30 minut). Od 0.3.2 taki podgląd kończy się po 20 s bez klatki i kamera wraca do
-uśpienia. Plik usuń ręcznie.
+`Connection Lost` co 30 minut). Od 0.3.4 taki podgląd kończy się po 20 s bez klatki i kamera wraca do
+uśpienia (0.3.2 i 0.3.3 kończyły sam podgląd, ale potrafiły dalej trzymać połączenie z kamerą). Plik usuń ręcznie.
 
 **Kopiowanie nagrania z karty SD trwa minuty** — przez 4G (przekaźnik Reolink) główny strumień
 płynie z prędkością ok. 75 KB/s: 37-sekundowe nagranie (16 MB) kopiuje się ok. 3,5 minuty, a

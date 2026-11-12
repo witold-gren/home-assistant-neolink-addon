@@ -1,0 +1,123 @@
+From cefbe427f2798b8b1aaf8f30d57a47cbb70fa74e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Witold=20Gre=C5=84?= <witold.gren@gmail.com>
+Date: Thu, 12 Nov 2026 15:25:47 +0100
+Subject: [PATCH] stream: let the camera go when nobody listens or the camera
+ falls silent
+
+The task reading the camera's stream holds a use permit and waited for the camera's next
+data without limit. When the camera stopped sending, it never noticed that the live view had
+ended, so the camera stayed connected (and was connected again after each lost connection,
+as the task is rerun on a new connection). It now ends when its consumer is gone or after
+20 s without data.
+---
+ src/common/instance/gst.rs | 89 +++++++++++++++++++++++++++++++++-----
+ 1 file changed, 77 insertions(+), 12 deletions(-)
+
+diff --git a/src/common/instance/gst.rs b/src/common/instance/gst.rs
+index c03beb6..acc5dbd 100644
+--- a/src/common/instance/gst.rs
++++ b/src/common/instance/gst.rs
+@@ -186,19 +186,16 @@ impl NeoInstance {
+                     .run_task(move |cam| {
+                         let media_tx = media_tx.clone();
+                         Box::pin(async move {
+-                            let mut media_stream = cam.start_video(stream, 0, strict).await?;
++                            let media_stream = cam.start_video(stream, 0, strict).await?;
+                             log::trace!("Camera started");
+-                            while let Ok(media) = media_stream.get_data().await? {
+-                                // A consumer that stopped reading must not keep the camera
+-                                // awake: this task holds a use permit while it runs.
+-                                tokio::time::timeout(
+-                                    tokio::time::Duration::from_secs(15),
+-                                    media_tx.send(media),
+-                                )
+-                                .await
+-                                .map_err(|_| anyhow!("Stream consumer stalled for 15s"))??;
+-                            }
+-                            AnyResult::Ok(())
++                            let data = futures::stream::unfold(media_stream, |mut s| async move {
++                                match s.get_data().await {
++                                    Ok(Ok(media)) => Some((AnyResult::Ok(media), s)),
++                                    Ok(Err(_)) => None,
++                                    Err(e) => Some((Err(e.into()), s)),
++                                }
++                            });
++                            forward(Box::pin(data), &media_tx, CAMERA_SILENCE).await
+                         })
+                     })
+                     .await
+@@ -212,3 +209,71 @@ impl NeoInstance {
+         Ok(media_rx)
+     }
+ }
++
++/// How long a stream waits for the camera's next data before it lets the camera go
++const CAMERA_SILENCE: Duration = Duration::from_secs(20);
++/// How long a stream waits for a consumer that stopped reading
++const CONSUMER_STALL: Duration = Duration::from_secs(15);
++
++/// Pass the camera's data on until the camera ends the stream or nobody listens any more.
++///
++/// The caller holds a use permit meanwhile, so each way out lets the camera go: the consumer
++/// is gone (also while the camera sends nothing, which before kept a battery camera connected
++/// for hours), the camera has sent nothing for `silence`, or the consumer stalled.
++pub(crate) async fn forward<T, S>(
++    mut data: S,
++    media_tx: &tokio::sync::mpsc::Sender<T>,
++    silence: Duration,
++) -> AnyResult<()>
++where
++    S: futures::Stream<Item = AnyResult<T>> + Unpin,
++{
++    loop {
++        let media = tokio::select! {
++            _ = media_tx.closed() => return Ok(()),
++            data = tokio::time::timeout(silence, data.next()) => data
++                .map_err(|_| anyhow!("No data from the camera for {silence:?}"))?,
++        };
++        let Some(media) = media else {
++            return Ok(());
++        };
++        let sent = tokio::time::timeout(CONSUMER_STALL, media_tx.send(media?))
++            .await
++            .map_err(|_| anyhow!("Stream consumer stalled for {CONSUMER_STALL:?}"))?;
++        if sent.is_err() {
++            return Ok(()); // The consumer is gone
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn a_stream_lets_the_camera_go() {
++        let silent = || futures::stream::pending::<AnyResult<u8>>();
++
++        // The consumer leaves while the camera sends nothing
++        let (tx, rx) = tokio::sync::mpsc::channel::<u8>(4);
++        let waiting =
++            tokio::spawn(async move { forward(silent(), &tx, Duration::from_secs(3600)).await });
++        tokio::task::yield_now().await;
++        drop(rx);
++        assert!(waiting.await.unwrap().is_ok());
++
++        // The camera sends nothing for the silence limit
++        let (tx, _rx) = tokio::sync::mpsc::channel::<u8>(4);
++        let error = forward(silent(), &tx, Duration::from_millis(100))
++            .await
++            .unwrap_err();
++        assert!(error.to_string().contains("No data from the camera"), "{error}");
++
++        // Data passes on until the camera ends the stream
++        let (tx, mut rx) = tokio::sync::mpsc::channel::<u8>(4);
++        let data = futures::stream::iter([AnyResult::Ok(1u8), Ok(2)]);
++        forward(data, &tx, Duration::from_secs(20)).await.unwrap();
++        assert_eq!(rx.recv().await, Some(1));
++        assert_eq!(rx.recv().await, Some(2));
++    }
++}
+-- 
+2.54.0 (Apple Git-157)
+

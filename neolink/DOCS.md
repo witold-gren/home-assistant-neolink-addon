@@ -90,8 +90,8 @@ the newest recording after a motion alert.
 **A recorded live view is long but shows only a moment, and the battery ran down** — up to 0.3.1 a
 live view whose camera stopped sending after a few frames waited for the next one forever and kept
 the camera connected (the log shows `Buffer full on vidsrc ...`, then only `Connection Lost` every 30
-minutes). From 0.3.2 such a live view ends after 20 s without a frame and the camera goes back to
-sleep. Delete the file by hand.
+minutes). From 0.3.4 such a live view ends after 20 s without a frame and the camera goes back to
+sleep (0.3.2 and 0.3.3 ended the live view but could still keep the camera connected). Delete the file by hand.
 
 **Copying a recording from the SD card takes minutes** — over 4G (Reolink's relay) the main stream
 comes at about 75 KB/s: a 37-second recording (16 MB) takes about 3.5 minutes, and recordings are
