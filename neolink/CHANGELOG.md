@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.5
+- The app no longer stops when a live view ends while a player is still connecting. A camera that
+  fell silent right after a player came made the player's PLAY wait for a frame; the end of that
+  live view let the PLAY through without one and GStreamer's RTSP server stopped the whole app
+  (`gst_rtsp_media_get_rates: assertion failed`), so every camera was unavailable until a restart.
+  Such a PLAY is now answered 503 and the player tries again.
+
 ## 0.3.4
 - A live view whose camera stops sending now really lets the camera go. 0.3.2 ended the live view
   itself, but the task reading the camera's stream kept waiting for data and held the camera

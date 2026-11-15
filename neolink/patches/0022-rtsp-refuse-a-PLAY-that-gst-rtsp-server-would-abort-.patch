@@ -1,0 +1,207 @@
+From 4981be61fa465f38e45802489ee47e6bb1f70b58 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Witold=20Gre=C5=84?= <witold.gren@gmail.com>
+Date: Sun, 15 Nov 2026 14:10:11 +0100
+Subject: [PATCH] rtsp: refuse a PLAY that gst-rtsp-server would abort on
+
+A live view that gives up on a silent camera ends its sources with EOS. When a client's PLAY
+was waiting for the camera's next frame at that moment (the media had been suspended after
+DESCRIBE, which drops what had streamed), the PLAY went on without a segment and
+gst_rtsp_media_get_rates aborted the whole process ("complete stream without rate", an
+assertion in GStreamer 1.22): every camera was gone until a restart. The client class's
+adjust_play_mode, which runs just before that check, now answers such a PLAY with 503 Service
+Unavailable and the client retries.
+---
+ src/rtsp/gst/server.rs | 151 ++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 148 insertions(+), 3 deletions(-)
+
+diff --git a/src/rtsp/gst/server.rs b/src/rtsp/gst/server.rs
+index d41a72e..b749ecd 100644
+--- a/src/rtsp/gst/server.rs
++++ b/src/rtsp/gst/server.rs
+@@ -7,13 +7,13 @@ use super::AnyResult;
+ use crate::config::*;
+ 
+ use anyhow::Context;
+-use gstreamer::glib::{self, object_subclass, MainLoop, Object};
++use gstreamer::glib::{self, object_subclass, translate::*, MainLoop, Object};
+ use gstreamer_rtsp::RTSPAuthMethod;
+ use gstreamer_rtsp_server::{
+     gio::{TlsAuthenticationMode, TlsCertificate},
+     prelude::*,
+     subclass::prelude::*,
+-    RTSPAuth, RTSPFilterResult, RTSPMountPoints, RTSPServer, RTSPToken,
++    RTSPAuth, RTSPClient, RTSPFilterResult, RTSPMedia, RTSPMountPoints, RTSPServer, RTSPToken,
+     RTSP_TOKEN_MEDIA_FACTORY_ROLE,
+ };
+ use log::*;
+@@ -43,6 +43,7 @@ impl Default for NeoRtspServer {
+ impl NeoRtspServer {
+     pub(crate) fn new() -> AnyResult<Self> {
+         gstreamer::init().context("Gstreamer failed to initialise")?;
++        guard_play_requests();
+         let factory = Object::new::<NeoRtspServer>();
+ 
+         // Setup auth
+@@ -194,6 +195,50 @@ impl RTSPMountPointsImpl for NeoMountPointsImpl {
+     }
+ }
+ 
++/// Refuses a PLAY that would abort the whole process.
++///
++/// gst-rtsp-server asserts in `gst_rtsp_media_get_rates` ("complete stream without rate",
++/// GStreamer 1.22) when a stream it is about to play has carried no data. That happens when a
++/// live view gives up on a silent camera: the media was suspended after DESCRIBE (Reset drops
++/// what had streamed), the client's PLAY waits for the camera's next frame, and the EOS that
++/// ends the live view lets the PLAY through without one. On 2026-11-15 this took every camera of
++/// the add-on away until a restart. The client class's `adjust_play_mode` runs just before that
++/// assertion, so such a PLAY is answered 503 Service Unavailable instead and the client retries.
++fn guard_play_requests() {
++    static GUARD: std::sync::Once = std::sync::Once::new();
++    GUARD.call_once(|| unsafe {
++        // Every client is a GstRTSPClient; the class reference is kept for the life of the
++        // process, and the function is set before the first client exists
++        let class = glib::gobject_ffi::g_type_class_ref(RTSPClient::static_type().into_glib())
++            as *mut gstreamer_rtsp_server::ffi::GstRTSPClientClass;
++        (*class).adjust_play_mode = Some(refuse_play_that_would_abort);
++    });
++}
++
++unsafe extern "C" fn refuse_play_that_would_abort(
++    _client: *mut gstreamer_rtsp_server::ffi::GstRTSPClient,
++    ctx: *mut gstreamer_rtsp_server::ffi::GstRTSPContext,
++    _range: *mut *mut gstreamer_rtsp::ffi::GstRTSPTimeRange,
++    _flags: *mut gstreamer::ffi::GstSeekFlags,
++    _rate: *mut std::ffi::c_double,
++    _trickmode_interval: *mut gstreamer::ffi::GstClockTime,
++    _enable_rate_control: *mut glib::ffi::gboolean,
++) -> gstreamer_rtsp::ffi::GstRTSPStatusCode {
++    let media = (*ctx).media;
++    if !media.is_null() && play_would_abort(&from_glib_borrow::<_, RTSPMedia>(media)) {
++        warn!("Refusing a PLAY: a stream has carried no data yet (the camera fell silent)");
++        return gstreamer_rtsp::ffi::GST_RTSP_STS_SERVICE_UNAVAILABLE;
++    }
++    gstreamer_rtsp::ffi::GST_RTSP_STS_OK
++}
++
++/// What `gst_rtsp_media_get_rates` asserts on: a complete sending stream without a segment.
++fn play_would_abort(media: &RTSPMedia) -> bool {
++    (0..media.n_streams())
++        .filter_map(|index| media.stream(index))
++        .any(|stream| stream.is_complete() && stream.is_sender() && stream.rates().is_none())
++}
++
+ fn strip_fragments(path: &str) -> String {
+     let mut out = String::with_capacity(path.len());
+     let mut skipping = false;
+@@ -213,7 +258,107 @@ fn strip_fragments(path: &str) -> String {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::strip_fragments;
++    use super::*;
++    use gstreamer_app::AppSrc;
++
++    /// The camera sends one frame - DESCRIBE prerolls on it - and falls silent, so the PLAY
++    /// after it waits for a frame that never comes. Three seconds in, the live view gives up on
++    /// the camera and ends its source with EOS, as `make_factory` does after its idle limit.
++    fn silent_camera(src: AppSrc) {
++        let _ = src.push_buffer(gstreamer::Buffer::from_mut_slice(vec![0u8; 320]));
++        std::thread::sleep(std::time::Duration::from_secs(3));
++        let _ = src.end_of_stream();
++    }
++
++    /// The camera sends a frame every 20 ms for four seconds.
++    fn streaming_camera(src: AppSrc) {
++        for _ in 0..200 {
++            let _ = src.push_buffer(gstreamer::Buffer::from_mut_slice(vec![0u8; 320]));
++            std::thread::sleep(std::time::Duration::from_millis(20));
++        }
++    }
++
++    /// Serves one stream the way the add-on does (not shared, suspended with Reset after
++    /// DESCRIBE), fed by `camera` on its own thread. A client plays it for `seconds`; returns
++    /// how many buffers the client got. A process that aborts in gst-rtsp-server never returns:
++    /// the whole test binary fails.
++    fn serve_and_play(port: u16, seconds: u64, camera: fn(AppSrc)) -> usize {
++        use std::sync::atomic::{AtomicUsize, Ordering};
++
++        gstreamer::init().unwrap();
++        let context = glib::MainContext::new();
++        let main_loop = MainLoop::new(Some(&context), false);
++        let server = RTSPServer::new();
++        server.set_address("127.0.0.1");
++        server.set_service(&port.to_string());
++        let factory = gstreamer_rtsp_server::RTSPMediaFactory::new();
++        // Raw audio: any bytes make a valid frame
++        factory.set_launch(
++            "( appsrc name=camsrc is-live=true do-timestamp=true format=time \
++               caps=audio/x-raw,format=S16BE,layout=interleaved,rate=8000,channels=1 \
++               ! rtpL16pay name=pay0 pt=96 )",
++        );
++        factory.set_shared(false);
++        factory.set_suspend_mode(gstreamer_rtsp_server::RTSPSuspendMode::Reset);
++        factory.connect_media_configure(move |_, media| {
++            let bin = media.element().dynamic_cast::<gstreamer::Bin>().unwrap();
++            let src = bin
++                .by_name_recurse_up("camsrc")
++                .unwrap()
++                .dynamic_cast::<AppSrc>()
++                .unwrap();
++            std::thread::spawn(move || camera(src));
++        });
++        server.mount_points().unwrap().add_factory("/test", factory);
++        let _source = server.attach(Some(&context)).unwrap();
++        let looping = main_loop.clone();
++        let serving = std::thread::spawn(move || {
++            context.with_thread_default(|| looping.run()).unwrap();
++        });
++
++        let client = gstreamer::parse::launch(&format!(
++            "rtspsrc location=rtsp://127.0.0.1:{port}/test protocols=tcp \
++             ! fakesink name=sink signal-handoffs=true"
++        ))
++        .unwrap()
++        .dynamic_cast::<gstreamer::Bin>()
++        .unwrap();
++        let got = Arc::new(AtomicUsize::new(0));
++        let counter = got.clone();
++        client
++            .by_name("sink")
++            .unwrap()
++            .connect("handoff", false, move |_| {
++                counter.fetch_add(1, Ordering::SeqCst);
++                None
++            });
++        client.set_state(gstreamer::State::Playing).unwrap();
++        std::thread::sleep(std::time::Duration::from_secs(seconds));
++        client.set_state(gstreamer::State::Null).unwrap();
++        main_loop.quit();
++        serving.join().unwrap();
++        got.load(Ordering::SeqCst)
++    }
++
++    #[test]
++    fn a_play_that_would_abort_is_refused() {
++        guard_play_requests();
++        // Without the guard this aborts: "gst_rtsp_media_get_rates: assertion failed"
++        assert_eq!(serve_and_play(18557, 5, silent_camera), 0);
++    }
++
++    #[test]
++    fn a_streaming_camera_still_plays() {
++        guard_play_requests();
++        assert!(serve_and_play(18558, 3, streaming_camera) > 10);
++    }
++
++    #[test]
++    #[ignore = "aborts the test process: the gst-rtsp-server crash of 2026-11-15; run it alone, \
++                in one process with the others the guard covers it"]
++    fn play_of_a_stream_without_data_aborts_the_server() {
++        serve_and_play(18556, 5, silent_camera);
++    }
+ 
+     #[test]
+     fn fragments_are_dropped() {
+-- 
+2.54.0 (Apple Git-157)
+

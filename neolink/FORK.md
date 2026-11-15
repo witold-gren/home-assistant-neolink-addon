@@ -18,6 +18,10 @@ app's Dockerfile:
 - an RTSP stream never keeps a battery camera awake without a client: a one-frame buffer instead of a
   blocking pool (#340), `appsrc` flushing or not playing ends the stream after 15 s, and the stream
   task ends when nobody takes frames for 15 s;
+- a PLAY on a stream that has carried no data yet (a live view ending while the client's PLAY waited
+  for the camera's frame) is answered 503 Service Unavailable in the client class's
+  `adjust_play_mode`, instead of letting `gst_rtsp_media_get_rates` abort the process (an assertion
+  in GStreamer 1.22);
 - optional PIR XML fields (`rfID`, `sensitivity`, `timeBlockList`, `alarmHandle`): the Reolink Go Plus
   does not send them and a parse error dropped the connection;
 - log timestamps in local time (`TZ`);

@@ -94,6 +94,11 @@ klatkę bez końca i trzymał połączenie z kamerą (w dzienniku `Buffer full o
 `Connection Lost` co 30 minut). Od 0.3.4 taki podgląd kończy się po 20 s bez klatki i kamera wraca do
 uśpienia (0.3.2 i 0.3.3 kończyły sam podgląd, ale potrafiły dalej trzymać połączenie z kamerą). Plik usuń ręcznie.
 
+**Aplikacja się zatrzymała i wszystkie kamery są niedostępne; dziennik kończy się wpisem `Bail out! GStreamer-RTSP-Server:ERROR:...gst_rtsp_media_get_rates: assertion failed: (FALSE)`**
+— do wersji 0.3.4 podgląd, który kończył się, gdy odtwarzacz dopiero łączył się z kamerą, która
+ucichła, zatrzymywał całą aplikację. Od 0.3.5 odtwarzacz dostaje błąd i próbuje ponownie. Włączony
+**Watchdog** aplikacji (zakładka Informacje) dodatkowo sam ją uruchamia po każdej awarii.
+
 **Kopiowanie nagrania z karty SD trwa minuty** — przez 4G (przekaźnik Reolink) główny strumień
 płynie z prędkością ok. 75 KB/s: 37-sekundowe nagranie (16 MB) kopiuje się ok. 3,5 minuty, a
 nagrania kopiują się po kolei. Wybierz `sd_stream: sub`, żeby kopie trwały sekundy (mniejszy obraz).

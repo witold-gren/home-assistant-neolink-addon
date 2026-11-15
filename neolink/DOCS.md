@@ -93,6 +93,11 @@ the camera connected (the log shows `Buffer full on vidsrc ...`, then only `Conn
 minutes). From 0.3.4 such a live view ends after 20 s without a frame and the camera goes back to
 sleep (0.3.2 and 0.3.3 ended the live view but could still keep the camera connected). Delete the file by hand.
 
+**The app stopped and every camera is unavailable; the log ends with `Bail out! GStreamer-RTSP-Server:ERROR:...gst_rtsp_media_get_rates: assertion failed: (FALSE)`**
+— up to 0.3.4 a live view that ended while a player was still connecting to a silent camera stopped
+the whole app. From 0.3.5 the player gets an error and tries again. Turning on the app's
+**Watchdog** (Info tab) also restarts the app by itself after any crash.
+
 **Copying a recording from the SD card takes minutes** — over 4G (Reolink's relay) the main stream
 comes at about 75 KB/s: a 37-second recording (16 MB) takes about 3.5 minutes, and recordings are
 copied one after another. Choose `sd_stream: sub` for copies in seconds (a smaller picture). Up to
