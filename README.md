@@ -26,6 +26,16 @@ What you get together with the integration:
 Documentation: [neolink/DOCS.md](neolink/DOCS.md); the fork and its WebSocket protocol:
 [neolink/FORK.md](neolink/FORK.md).
 
+## Screenshots
+
+The app's configuration (the camera UID is masked) and the device of a Reolink Go Plus / G330 (4G)
+with the entities the Neolink integration creates (the pictures from the camera are blurred):
+
+<p>
+  <img src="images/addon-configuration-en.png" alt="Neolink app configuration" width="49%">
+  <img src="images/camera-device-entities-en.png" alt="Reolink camera device with its entities" width="49%">
+</p>
+
 ## Repository layout
 | Path | What it is |
 |---|---|

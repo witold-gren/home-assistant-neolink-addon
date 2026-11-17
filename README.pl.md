@@ -27,6 +27,16 @@ Co dostajesz razem z integracją:
 Dokumentacja: [neolink/DOCS.pl.md](neolink/DOCS.pl.md); fork i jego protokół WebSocket (po angielsku):
 [neolink/FORK.md](neolink/FORK.md).
 
+## Zrzuty ekranu
+
+Konfiguracja aplikacji (UID kamery zamaskowany) i urządzenie Reolink Go Plus / G330 (4G) z encjami,
+które tworzy integracja Neolink (obrazy z kamery rozmyte):
+
+<p>
+  <img src="images/addon-configuration-pl.png" alt="Konfiguracja aplikacji Neolink" width="49%">
+  <img src="images/camera-device-entities-pl.png" alt="Urządzenie kamery Reolink z encjami" width="49%">
+</p>
+
 ## Struktura repozytorium
 | Ścieżka | Co to jest |
 |---|---|
