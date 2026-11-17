@@ -1,0 +1,296 @@
+From f06f975877bf592b9ac61b14ab11daa6ac2aabd5 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Witold=20Gre=C5=84?= <witold.gren@gmail.com>
+Date: Tue, 17 Nov 2026 23:06:49 +0100
+Subject: [PATCH] talk: feed the camera's speaker in real time
+
+A live talk waited for the camera's answer to each ADPCM block (64 ms of sound) before sending
+the next one. Over a 4G relay that round trip is longer than the block, so the sound reached the
+camera slower than it was spoken: the talker's queue (30 blocks) filled, the voice lagged more
+and more and was cut where the queue overflowed.
+
+The live talk (WebSocket /talk) now uses BcCamera::talk_live: the blocks come over a tokio
+channel and are sent as they come, the camera's answers are read beside the sending (no blocking
+read inside the async task either), and the sending is only held back when it is more than
+300 ms ahead of what the camera has played. The queue is 8 blocks (about half a second): when
+the link stalls, new sound is dropped instead of being played late. talk_stream, used to play
+files, is unchanged.
+---
+ crates/core/src/bc_protocol/talk.rs | 166 ++++++++++++++++++++++++----
+ src/ws/talk.rs                      |  23 ++--
+ 2 files changed, 161 insertions(+), 28 deletions(-)
+
+diff --git a/crates/core/src/bc_protocol/talk.rs b/crates/core/src/bc_protocol/talk.rs
+index df42e86..cae2fed 100644
+--- a/crates/core/src/bc_protocol/talk.rs
++++ b/crates/core/src/bc_protocol/talk.rs
+@@ -239,25 +239,9 @@ impl BcCamera {
+         Ok(())
+     }
+ 
+-    ///
+-    /// Send sound to the camera through a channel
+-    ///
+-    /// This is similar to [`talk`] except it uses a channel to receive data
+-    ///
+-    /// The data should be in the format as described in `<TalkAbility>` xml
+-    /// This method assumes that you have set up the data in the desired format
+-    /// in the `<TalkAbility>` xml
+-    ///
+-    /// It also checks that it is ADPCM as the code is written to accept only that
+-    ///
+-    /// # Parameters
+-    ///
+-    /// * `adpcm` - Data must be adpcm in DVI-4 format
+-    ///
+-    /// * `talk_config` - The talk config that describes the adpcm data
+-    ///
+-    ///
+-    pub async fn talk_stream(&self, rx: Receiver<Vec<u8>>, talk_config: TalkConfig) -> Result<()> {
++    /// Send the talk configuration; the camera then takes ADPCM blocks of `block_size` bytes (plus
++    /// the 4 bytes of the predictor state) at `sample_rate`
++    async fn talk_begin(&self, talk_config: TalkConfig) -> Result<(u16, u16)> {
+         let connection = self.get_connection();
+ 
+         let msg_num = self.new_message_num();
+@@ -320,6 +304,30 @@ impl BcCamera {
+                     "The camera did not accept the TalkConfig xml. Audio format is likely incorrect",
+             });
+         }
++        Ok((block_size, sample_rate))
++    }
++
++    ///
++    /// Send sound to the camera through a channel
++    ///
++    /// This is similar to [`talk`] except it uses a channel to receive data
++    ///
++    /// The data should be in the format as described in `<TalkAbility>` xml
++    /// This method assumes that you have set up the data in the desired format
++    /// in the `<TalkAbility>` xml
++    ///
++    /// It also checks that it is ADPCM as the code is written to accept only that
++    ///
++    /// # Parameters
++    ///
++    /// * `adpcm` - Data must be adpcm in DVI-4 format
++    ///
++    /// * `talk_config` - The talk config that describes the adpcm data
++    ///
++    ///
++    pub async fn talk_stream(&self, rx: Receiver<Vec<u8>>, talk_config: TalkConfig) -> Result<()> {
++        let connection = self.get_connection();
++        let (block_size, sample_rate) = self.talk_begin(talk_config).await?;
+ 
+         let full_block_size = block_size + 4; // Block size + predictor state
+         let msg_num = self.new_message_num();
+@@ -419,6 +427,94 @@ impl BcCamera {
+     }
+ }
+ 
++impl BcCamera {
++    /// Talk live: ADPCM blocks (block size + 4 bytes of predictor state, as the TalkConfig says)
++    /// are sent to the camera as they come, a block per message.
++    ///
++    /// `talk_stream` waits for the camera's answer to each message before the next one, which over
++    /// a 4G relay (a round trip longer than the 64 ms a block plays) sends slower than real time:
++    /// the talker's queue fills, the sound lags further and further and is cut where the queue
++    /// overflows. Here the answers are read beside the sending, and the sending is only held back
++    /// when it is more than `TALK_LEAD` ahead of what the camera has played.
++    pub async fn talk_live(
++        &self,
++        mut rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
++        talk_config: TalkConfig,
++    ) -> Result<()> {
++        let connection = self.get_connection();
++        let (_block_size, sample_rate) = self.talk_begin(talk_config).await?;
++        let msg_num = self.new_message_num();
++        let mut sub = connection.subscribe(MSG_ID_TALK, msg_num).await?;
++
++        // When the sound sent so far ends playing on the camera
++        let mut played_until = tokio::time::Instant::now();
++        loop {
++            tokio::select! {
++                block = rx.recv() => {
++                    let Some(block) = block else { break };
++                    if block.len() <= 4 {
++                        continue;
++                    }
++                    let now = tokio::time::Instant::now();
++                    if let Some(wait) = send_delay(played_until, now, TALK_LEAD) {
++                        tokio::time::sleep(wait).await;
++                    }
++                    let length = block_duration(block.len(), sample_rate.into());
++                    let payload = BcMedia::Adpcm(BcMediaAdpcm { data: block }).serialize(vec![])?;
++                    let msg = Bc {
++                        meta: BcMeta {
++                            msg_id: MSG_ID_TALK,
++                            channel_id: self.channel_id,
++                            msg_num,
++                            stream_type: 0,
++                            response_code: 0,
++                            class: 0x6414,
++                        },
++                        body: BcBody::ModernMsg(ModernMsg {
++                            extension: Some(Extension {
++                                channel_id: Some(self.channel_id),
++                                binary_data: Some(1),
++                                ..Default::default()
++                            }),
++                            payload: Some(BcPayloads::Binary(payload)),
++                        }),
++                    };
++                    sub.send(msg).await?;
++                    played_until = std::cmp::max(played_until, tokio::time::Instant::now()) + length;
++                }
++                // The camera's answers: read so that they do not pile up
++                answer = sub.recv() => {
++                    answer?;
++                }
++            }
++        }
++
++        // What was sent is still playing; stopping now would cut it
++        tokio::time::sleep_until(played_until + std::time::Duration::from_millis(100)).await;
++        self.talk_stop().await?;
++        Ok(())
++    }
++}
++
++/// How far ahead of the camera's playing the live talk may send (the camera buffers this much)
++const TALK_LEAD: std::time::Duration = std::time::Duration::from_millis(300);
++
++/// How long an ADPCM block plays: 2 samples a byte after the 4-byte header, which holds 1 sample
++fn block_duration(block_len: usize, sample_rate: u32) -> std::time::Duration {
++    let samples = block_len.saturating_sub(4) * 2 + 1;
++    std::time::Duration::from_secs_f64(samples as f64 / sample_rate.max(1) as f64)
++}
++
++/// How long to wait before the next block, so that what was sent stays at most `lead` ahead
++fn send_delay(
++    played_until: tokio::time::Instant,
++    now: tokio::time::Instant,
++    lead: std::time::Duration,
++) -> Option<std::time::Duration> {
++    let ahead = played_until.checked_duration_since(now)?;
++    ahead.checked_sub(lead).filter(|wait| !wait.is_zero())
++}
++
+ struct BufferedStream {
+     rx: Receiver<Vec<u8>>,
+     buffer: Vec<u8>,
+@@ -480,3 +576,35 @@ impl BufRead for BufferedStream {
+         self.consumed += amt;
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::time::Duration;
++
++    #[test]
++    fn a_reolink_block_plays_64_ms() {
++        // 16 kHz, lengthPerEncoder 1024: 512 bytes of samples + 4 of header = 1025 samples
++        let length = block_duration(516, 16000);
++        assert!((length.as_secs_f64() - 1025.0 / 16000.0).abs() < 1e-9);
++    }
++
++    #[test]
++    fn sending_waits_only_when_far_ahead_of_the_camera() {
++        let now = tokio::time::Instant::now();
++        let lead = Duration::from_millis(300);
++        // Nothing playing, or behind: send at once
++        assert_eq!(send_delay(now, now, lead), None);
++        assert_eq!(send_delay(now - Duration::from_secs(1), now, lead), None);
++        // Within the lead: send at once
++        assert_eq!(
++            send_delay(now + Duration::from_millis(250), now, lead),
++            None
++        );
++        // Beyond the lead: wait for the excess only
++        assert_eq!(
++            send_delay(now + Duration::from_millis(500), now, lead),
++            Some(Duration::from_millis(200))
++        );
++    }
++}
+diff --git a/src/ws/talk.rs b/src/ws/talk.rs
+index 1ef3fbd..4c668c4 100644
+--- a/src/ws/talk.rs
++++ b/src/ws/talk.rs
+@@ -10,7 +10,6 @@
+ //! One talker per camera at a time: a second one gets `busy`.
+ use anyhow::{anyhow, Context, Result};
+ use axum::extract::ws::{Message, WebSocket};
+-use crossbeam_channel::{bounded, Receiver, Sender};
+ use gstreamer::{prelude::*, Caps, Element, ElementFactory, FlowError, FlowSuccess, Pipeline};
+ use gstreamer_app::{AppSink, AppSinkCallbacks, AppSrc, AppStreamType};
+ use serde_json::{json, Value};
+@@ -18,13 +17,16 @@ use std::{
+     collections::HashSet,
+     sync::{Mutex, OnceLock},
+ };
++use tokio::sync::mpsc::{channel as bounded, error::TrySendError, Receiver, Sender};
+ 
+ use crate::common::NeoInstance;
+ 
+ /// Sample rates a client may send
+ pub(crate) const RATES: std::ops::RangeInclusive<u32> = 8000..=48000;
+-/// ADPCM blocks waiting for the camera; a full queue drops the oldest sound, never blocks the talker
+-const QUEUE_BLOCKS: usize = 30;
++/// ADPCM blocks (64 ms each on a Reolink) waiting for the camera: about half a second. The camera
++/// is fed in real time, so the queue stays short; when the link stalls, new sound is dropped rather
++/// than played late (a longer queue only made the talk lag behind).
++const QUEUE_BLOCKS: usize = 8;
+ 
+ static TALKING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+ 
+@@ -112,8 +114,8 @@ impl Encoder {
+                         .ok_or(FlowError::Error)?;
+                     // The camera is gone: stop encoding
+                     tx.try_send(block).or_else(|e| match e {
+-                        crossbeam_channel::TrySendError::Full(_) => Ok(()),
+-                        crossbeam_channel::TrySendError::Disconnected(_) => Err(FlowError::Eos),
++                        TrySendError::Full(_) => Ok(()),
++                        TrySendError::Closed(_) => Err(FlowError::Eos),
+                     })?;
+                     Ok(FlowSuccess::Ok)
+                 })
+@@ -237,11 +239,14 @@ async fn talk(
+         .send(Message::Text(state("connected").to_string()))
+         .await;
+     log::info!("{name}: talking ({rate} Hz in, ADPCM {camera_rate} Hz to the camera)");
++    // The receiver goes to the first run of the task; a rerun (a new connection) has no sound left
++    let rx = std::sync::Arc::new(std::sync::Mutex::new(Some(rx)));
+     let mut playing = Box::pin(camera.run_task(move |cam| {
+-        let rx = rx.clone();
++        let rx = rx.lock().unwrap().take();
+         let talk_config = talk_config.clone();
+         Box::pin(async move {
+-            cam.talk_stream(rx, talk_config).await?;
++            let rx = rx.ok_or_else(|| anyhow!("the connection to the camera was lost"))?;
++            cam.talk_live(rx, talk_config).await?;
+             Ok(())
+         })
+     }));
+@@ -304,7 +309,7 @@ mod tests {
+     fn microphone_pcm_becomes_camera_adpcm_blocks() {
+         gstreamer::init().unwrap();
+         // A Reolink speaker: 16 kHz ADPCM, lengthPerEncoder 1024 -> blocks of 1024/2 + 4 bytes
+-        let (tx, rx) = bounded(1000);
++        let (tx, mut rx) = bounded(1000);
+         let encoder = Encoder::new(48000, 16000, 516, tx).unwrap();
+         // One second of a 440 Hz tone at 48 kHz, as a browser sends it (20 ms frames)
+         let samples: Vec<u8> = (0..48000)
+@@ -318,7 +323,7 @@ mod tests {
+             encoder.push(frame).unwrap();
+         }
+         encoder.finish();
+-        let blocks: Vec<Vec<u8>> = rx.try_iter().collect();
++        let blocks: Vec<Vec<u8>> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+         // 16000 samples of 4-bit ADPCM in blocks of 1025 samples (1 in the header + 1024)
+         assert!(blocks.len() >= 14, "{} blocks", blocks.len());
+         assert!(blocks.iter().all(|b| b.len() == 516));
+-- 
+2.54.0 (Apple Git-157)
+

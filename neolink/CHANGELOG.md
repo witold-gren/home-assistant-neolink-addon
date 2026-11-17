@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.1
+- Talking through the camera's speaker no longer lags and breaks up. The app waited for the
+  camera's answer to every 64 ms of sound before sending the next; over 4G that answer takes
+  longer, so the voice reached the camera slower than it was spoken, lagged more and more and was
+  cut where the queue overflowed. The sound is now sent as it comes, at most 0.3 s ahead of what
+  the camera has played, and the queue holds half a second instead of two.
+
 ## 0.4.0
 - The live view of a sleeping camera opens in about 5 seconds instead of about 40, and its sound
   is in time with the picture. Home Assistant's WebRTC (go2rtc) waits only 5 seconds for each

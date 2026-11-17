@@ -91,6 +91,12 @@ app answers at once with the stream's last start (kept in `/data/snapshots/strea
 wakes; set the Neolink integration (0.4.0+) to **WebRTC only** (the default) so that a live view opens
 one camera stream. The very first live view after installing the app still waits for the camera.
 
+**Talking through the camera lags by seconds and the voice breaks up** — up to 0.4.0 the app waited
+for the camera's answer to every 64 ms of sound before sending more; over 4G (Reolink's relay) that
+round trip is longer, so the sound queued up and was cut when the queue overflowed. From 0.4.1 the
+sound goes to the camera as it is spoken (at most 0.3 s ahead), so the delay stays well under a
+second.
+
 **Sync recordings fails with "the download did not finish"** — over 4G a long recording of the main
 stream can take more than the 5 minutes allowed for one file. Choose `sd_stream: sub`, or copy only
 the newest recording after a motion alert.

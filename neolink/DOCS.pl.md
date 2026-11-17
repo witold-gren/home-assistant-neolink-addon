@@ -93,6 +93,12 @@ początku strumienia (w `/data/snapshots/stream`), a kamera budzi się w tle. W 
 (0.4.0+) ustaw **Tylko WebRTC** (domyślne), żeby podgląd otwierał jeden strumień kamery. Pierwszy
 podgląd po instalacji aplikacji nadal czeka na kamerę.
 
+**Mówienie przez kamerę ma kilka sekund opóźnienia, a głos się rwie** — do wersji 0.4.0 aplikacja
+czekała na odpowiedź kamery po każdych 64 ms dźwięku, zanim wysłała kolejne; przez 4G (przekaźnik
+Reolink) ta odpowiedź trwa dłużej, więc dźwięk ustawiał się w kolejce i był ucinany, gdy kolejka się
+przepełniła. Od 0.4.1 dźwięk idzie do kamery na bieżąco (najwyżej 0,3 s do przodu), więc opóźnienie
+zostaje wyraźnie poniżej sekundy.
+
 **Synchronizacja kończy się błędem „the download did not finish”** — przez 4G długie nagranie
 głównego strumienia może trwać dłużej niż 5 minut przewidzianych na jeden plik. Wybierz
 `sd_stream: sub` albo kopiuj tylko najnowsze nagranie po powiadomieniu o ruchu.
