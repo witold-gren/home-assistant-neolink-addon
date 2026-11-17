@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.0
+- The live view of a sleeping camera opens in about 5 seconds instead of about 40, and its sound
+  is in time with the picture. Home Assistant's WebRTC (go2rtc) waits only 5 seconds for each
+  answer of the RTSP server, while the app answered only after the camera had woken (10-20 s over
+  4G): WebRTC always failed and the browser fell back to HLS, slow to start and seconds behind.
+  The app now keeps the start of each camera stream (codecs and the first frames, in
+  `/data/snapshots/stream`) and answers a player at once with it while the camera wakes. The first
+  live view after installing this version still waits for the camera, the next ones do not.
+- Waking the camera is quicker: no fixed 4-second pause after the login, no 2-second wait for the
+  repeats of the connection's confirmation, and the Reolink relay is tried at once for a 4G
+  camera. Opened again right after the camera went to sleep, a live view no longer waits 15 s
+  for a Reolink server that keeps answering "wait": a second registration starts after 5 s.
+- A second player of a camera that is already awake gets its first frames in about a second
+  (about 5 seconds before).
+- Use it with the Neolink integration 0.4.0 or newer and its "WebRTC only" live view (the
+  default): Home Assistant otherwise also opens an HLS stream next to WebRTC, a second stream of
+  the camera over its mobile link.
+
 ## 0.3.5
 - The app no longer stops when a live view ends while a player is still connecting. A camera that
   fell silent right after a player came made the player's PLAY wait for a frame; the end of that

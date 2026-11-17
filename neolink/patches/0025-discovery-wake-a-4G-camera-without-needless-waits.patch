@@ -1,0 +1,175 @@
+From c6f3867a6436004b9aca016ace78d472799d6119 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Witold=20Gre=C5=84?= <witold.gren@gmail.com>
+Date: Tue, 17 Nov 2026 17:49:08 +0100
+Subject: [PATCH 25/25] discovery: wake a 4G camera without needless waits
+
+- The confirmation of a map or relay connection (C2R_CFM) is sent five times 500 ms apart, and
+  the connection waited for all five: 2 s between the camera's answer and the login. The first
+  copy goes out now and the repeats in the background.
+- A cellular camera, behind its operator's NAT, is reached through the relay, so the relay no
+  longer starts 500 ms late there (the map still races it).
+- Right after a camera has gone to sleep the Reolink server can answer a registration with
+  "wait" (R2C_T) for the whole 15 s before it is given up, while a fresh registration is
+  answered in about 3 s. A second registration with its own client id now starts 5 s after the
+  first and the first answer wins.
+---
+ crates/core/src/bc_protocol.rs                | 42 ++++++++++++-
+ .../src/bc_protocol/connection/discovery.rs   | 63 ++++++++++++++++---
+ 2 files changed, 95 insertions(+), 10 deletions(-)
+
+diff --git a/crates/core/src/bc_protocol.rs b/crates/core/src/bc_protocol.rs
+index 1e191bd..c77bfbd 100644
+--- a/crates/core/src/bc_protocol.rs
++++ b/crates/core/src/bc_protocol.rs
+@@ -12,6 +12,10 @@ use tokio_util::sync::CancellationToken;
+ 
+ use Md5Trunc::*;
+ 
++/// When a second registration with the Reolink servers starts beside one that is still waiting
++/// (a normal one is answered in about 3 s, while the camera wakes)
++const REGISTER_STAGGER: std::time::Duration = std::time::Duration::from_secs(5);
++
+ mod abilityinfo;
+ mod battery;
+ mod connection;
+@@ -235,7 +239,37 @@ impl BcCamera {
+                     let max_retry: usize = options.max_discovery_retries;
+                     loop {
+                         tokio::task::yield_now().await;
+-                        if let Ok(result) = discovery.get_registration(uid).await {
++                        // Right after a camera has gone to sleep the server can keep answering
++                        // a registration with "wait" (R2C_T) for its whole 15 s, while a fresh
++                        // registration is answered in about 3 s: a second one, with a client id
++                        // of its own, starts after REGISTER_STAGGER and the first answer wins.
++                        let answered = {
++                            let first = async {
++                                let result = discovery.get_registration(uid).await?;
++                                Result::Ok((None, result))
++                            };
++                            let second = async {
++                                tokio::time::sleep(REGISTER_STAGGER).await;
++                                let fresh = Discovery::new().await?;
++                                let result = fresh.get_registration(uid).await?;
++                                info!(
++                                    "{}: The second registration with reolink servers answered first",
++                                    options.name
++                                );
++                                Result::Ok((Some(fresh), result))
++                            };
++                            tokio::pin!(first);
++                            tokio::pin!(second);
++                            tokio::select! {
++                                Ok(v) = &mut first => Some(v),
++                                Ok(v) = &mut second => Some(v),
++                                else => None,
++                            }
++                        };
++                        if let Some((fresh, result)) = answered {
++                            if let Some(fresh) = fresh {
++                                discovery = fresh;
++                            }
+                             reg_result = result;
+                             break;
+                         }
+@@ -288,7 +322,11 @@ impl BcCamera {
+                         }, if allow_map => Ok(v),
+                         Ok(v) = async {
+                             let uid_relay = uid.clone();
+-                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
++                            // A 4G camera sits behind its operator's NAT: the relay is how it is
++                            // reached, so it starts at once there (the map still races it)
++                            if !matches!(options.discovery, DiscoveryMethods::Cellular) {
++                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
++                            }
+                             info!("{}: Trying relay discovery", options.name);
+                             let result = discovery.relay(&reg_result).await;
+                             match result {
+diff --git a/crates/core/src/bc_protocol/connection/discovery.rs b/crates/core/src/bc_protocol/connection/discovery.rs
+index 7fb70fc..b58cc24 100644
+--- a/crates/core/src/bc_protocol/connection/discovery.rs
++++ b/crates/core/src/bc_protocol/connection/discovery.rs
+@@ -322,22 +322,35 @@ impl Discoverer {
+         result
+     }
+ 
++    /// Send a message five times, 500 ms apart, without waiting for the repeats: the first copy
++    /// goes out now and the rest in the background. Waiting for all five held every connection
++    /// back by 2 s between the camera's confirmation and the login.
+     async fn send_and_forget(&self, mut disc: UdpDiscovery, dest: SocketAddr) -> Result<()> {
+         if disc.tid == 0 {
+             // If 0 make a random one
+             let target_tid = generate_tid();
+             disc.tid = target_tid;
+         }
+-        let mut inter = interval(*RESEND_WAIT);
+-        inter.set_missed_tick_behavior(MissedTickBehavior::Skip);
+         let msg = BcUdp::Discovery(disc);
++        self.send(msg.clone(), dest).await?;
+ 
+-        for _i in 0..5 {
+-            inter.tick().await;
+-
+-            self.send(msg.clone(), dest).await?;
+-        }
+-
++        let writer = self.writer.clone();
++        let cancel = self.cancel.clone();
++        self.handle.write().await.spawn(async move {
++            let mut inter = interval(*RESEND_WAIT);
++            inter.set_missed_tick_behavior(MissedTickBehavior::Skip);
++            inter.tick().await; // The first tick is now: that copy was sent above
++            for _i in 1..5 {
++                tokio::select! {
++                    _ = cancel.cancelled() => break,
++                    _ = inter.tick() => {}
++                }
++                if writer.send(Ok((msg.clone(), dest))).await.is_err() {
++                    break;
++                }
++            }
++            Result::Ok(())
++        });
+         Ok(())
+     }
+ 
+@@ -1561,3 +1574,37 @@ async fn connect() -> Result<UdpSocket> {
+     ```
+ 
+ */
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn a_confirmation_is_repeated_without_holding_the_connection_back() {
++        let discoverer = Discoverer::new().await.unwrap();
++        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++        let dest = receiver.local_addr().unwrap();
++        let msg = UdpDiscovery {
++            tid: 0,
++            payload: UdpXml::C2rCfm(C2rCfm {
++                sid: 1,
++                cid: 2,
++                did: 3,
++                rsp: 0,
++                conn: "relay".to_string(),
++            }),
++        };
++
++        let started = tokio::time::Instant::now();
++        discoverer.send_and_forget(msg, dest).await.unwrap();
++        // The first copy is sent, the four repeats (500 ms apart) do not hold the caller
++        assert!(started.elapsed() < Duration::from_millis(300));
++
++        let mut copies = 0;
++        let mut buf = [0u8; 2048];
++        while let Ok(Ok(_)) = timeout(Duration::from_secs(1), receiver.recv_from(&mut buf)).await {
++            copies += 1;
++        }
++        assert_eq!(copies, 5);
++    }
++}
+-- 
+2.54.0 (Apple Git-157)
+

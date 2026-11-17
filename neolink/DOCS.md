@@ -62,7 +62,7 @@ camera. Talking wakes the camera; over 4G expect a delay of a second or two.
 - `discovery: cellular` — connects only through Reolink's servers.
 - `stream: subStream` — about 110 kbit/s (0.8 MB per minute of viewing).
 - `idle_disconnect: true` — disconnects 30 s after the last use; a picture or a command wakes the
-  camera (first picture after about 15 s).
+  camera (first live picture after about 5 s; the player is answered at once, see below).
 - `battery_minutes` — reads the battery only while connected, never wakes the camera.
 - `push: true` — motion from Reolink push notifications (Firebase). The camera reports PIR detections
   even while it sleeps; the motion sensor in HA stays on for `motion_seconds` (default 30 s). Turning
@@ -82,6 +82,14 @@ Network libraries and the camera protocol stay at `info`. Go back to `info` afte
 Assistant's HLS player drops and go2rtc had to transcode for WebRTC while the camera was still waking.
 From 0.2.0 the sound comes as AAC and Opus. If there is still none, check that the camera's microphone
 is on in the Reolink app.
+
+**The live view takes about 40 seconds and its sound is late and choppy** — up to 0.3.5 the app
+answered a player only after the camera had woken (10-20 s over 4G), while Home Assistant's WebRTC
+(go2rtc) waits only 5 s for each RTSP answer. WebRTC failed, the browser fell back to HLS (slow to
+start, sound seconds behind) and HLS ran a second camera stream over the mobile link. From 0.4.0 the
+app answers at once with the stream's last start (kept in `/data/snapshots/stream`) while the camera
+wakes; set the Neolink integration (0.4.0+) to **WebRTC only** (the default) so that a live view opens
+one camera stream. The very first live view after installing the app still waits for the camera.
 
 **Sync recordings fails with "the download did not finish"** — over 4G a long recording of the main
 stream can take more than the 5 minutes allowed for one file. Choose `sd_stream: sub`, or copy only

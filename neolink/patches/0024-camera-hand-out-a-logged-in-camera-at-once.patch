@@ -1,0 +1,51 @@
+From 8d602df93f795958a242e98e8a3b882d1652da25 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Witold=20Gre=C5=84?= <witold.gren@gmail.com>
+Date: Tue, 17 Nov 2026 17:49:08 +0100
+Subject: [PATCH 24/25] camera: hand out a logged-in camera at once
+
+Two fixed 2 s pauses after the login (around the check of the camera's clock) held every task
+on a new connection back by 4 s, a live view included. The tasks already retry a refusal of a
+camera that is still waking (code 400), so the camera is handed out at once and its clock is
+checked in the background.
+---
+ src/common/camthread.rs | 22 ++++++++++++++++------
+ 1 file changed, 16 insertions(+), 6 deletions(-)
+
+diff --git a/src/common/camthread.rs b/src/common/camthread.rs
+index 7bdbd70..7a531ad 100644
+--- a/src/common/camthread.rs
++++ b/src/common/camthread.rs
+@@ -41,14 +41,24 @@ impl NeoCamThread {
+         let camera = Arc::new(connect_and_login(config).await?);
+         log::trace!("  - Connected");
+ 
+-        sleep(Duration::from_secs(2)).await; // Delay a little since some calls will error if camera is waking up
+-        if let Err(e) = update_camera_time(&camera, &name, config.update_time).await {
+-            log::warn!("Could not set camera time, (perhaps missing on this camera of your login in not an admin): {e:?}");
+-        }
+-        sleep(Duration::from_secs(2)).await; // Delay a little since some calls will error if camera is waking up
+-
++        // The camera is handed out at once. The two fixed 2 s pauses that were here (for calls that
++        // fail while a camera wakes) held every live view back by 4 s on each connection; the
++        // tasks retry such a refusal (code 400) themselves (NeoInstance::run_passive_task).
+         self.camera_watch.send_replace(Arc::downgrade(&camera));
+ 
++        let time_camera = Arc::downgrade(&camera);
++        let update_time = config.update_time;
++        tokio::spawn(async move {
++            // Low priority: after the first requests of a live view
++            sleep(Duration::from_secs(2)).await;
++            let Some(camera) = time_camera.upgrade() else {
++                return;
++            };
++            if let Err(e) = update_camera_time(&camera, &name, update_time).await {
++                log::warn!("Could not set camera time, (perhaps missing on this camera of your login in not an admin): {e:?}");
++            }
++        });
++
+         let cancel_check = self.cancel.clone();
+         // Now we wait for a disconnect
+         tokio::select! {
+-- 
+2.54.0 (Apple Git-157)
+

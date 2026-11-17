@@ -63,7 +63,7 @@ Mówienie budzi kamerę; przez 4G głos dociera z opóźnieniem sekundy lub dwó
 - `discovery: cellular` — łączy się wyłącznie przez serwery Reolink.
 - `stream: subStream` — około 110 kbit/s (0,8 MB na minutę oglądania).
 - `idle_disconnect: true` — rozłącza 30 s po ostatnim użyciu; zdjęcie lub polecenie budzi kamerę
-  (pierwszy obraz po około 15 s).
+  (pierwszy obraz na żywo po około 5 s; odtwarzacz dostaje odpowiedź od razu, patrz niżej).
 - `battery_minutes` — odczytuje baterię tylko podczas połączenia, nigdy nie budzi kamery.
 - `push: true` — ruch z powiadomień push Reolink (Firebase). Kamera zgłasza wykrycia PIR nawet
   podczas snu; czujnik ruchu w HA pozostaje włączony przez `motion_seconds` (domyślnie 30 s).
@@ -83,6 +83,15 @@ Biblioteki sieciowe i protokół kamery pozostają na poziomie `info`. Potem wr�
 które odtwarzacz HLS w Home Assistant pomija, a go2rtc musiał je przekodować do WebRTC, zanim kamera
 się obudziła. Od 0.2.0 dźwięk idzie jako AAC i Opus. Jeśli dalej go nie ma, sprawdź w aplikacji
 Reolink, czy mikrofon kamery jest włączony.
+
+**Podgląd na żywo startuje około 40 sekund, a dźwięk jest opóźniony i się rwie** — do wersji 0.3.5
+aplikacja odpowiadała odtwarzaczowi dopiero po obudzeniu kamery (10–20 s przez 4G), a WebRTC w Home
+Assistant (go2rtc) czeka na każdą odpowiedź RTSP tylko 5 s. WebRTC się nie udawał, przeglądarka
+przechodziła na HLS (wolny start, dźwięk kilka sekund za obrazem), a HLS otwierał drugi strumień
+kamery przez łącze komórkowe. Od 0.4.0 aplikacja odpowiada od razu na podstawie zapamiętanego
+początku strumienia (w `/data/snapshots/stream`), a kamera budzi się w tle. W integracji Neolink
+(0.4.0+) ustaw **Tylko WebRTC** (domyślne), żeby podgląd otwierał jeden strumień kamery. Pierwszy
+podgląd po instalacji aplikacji nadal czeka na kamerę.
 
 **Synchronizacja kończy się błędem „the download did not finish”** — przez 4G długie nagranie
 głównego strumienia może trwać dłużej niż 5 minut przewidzianych na jeden plik. Wybierz

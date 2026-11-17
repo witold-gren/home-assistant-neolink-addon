@@ -1,0 +1,1147 @@
+From ccc009cee728d50db9996944cc58ac54f010ac88 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Witold=20Gre=C5=84?= <witold.gren@gmail.com>
+Date: Tue, 17 Nov 2026 17:49:08 +0100
+Subject: [PATCH 23/25] rtsp: answer a new client at once from the stream's
+ last start
+
+A sleeping battery or 4G camera needs 10-20 s to connect and send its first frame, and a new
+RTSP client was answered only after that: the pipeline was built from the camera's first
+frames. go2rtc (Home Assistant's WebRTC) waits only 5 s for the answer to DESCRIBE, SETUP and
+PLAY whatever #timeout= says, so a live view of a sleeping camera always failed over WebRTC and
+the browser fell back to HLS (about 40 s to a picture, sound seconds behind).
+
+Each live view now keeps the start of its stream (codecs, frame rate, the first keyframe with
+its parameter sets, the first audio frame) in memory and in <snapshot_dir>/stream. The next
+client gets a pipeline prerolled with that start at once (the keyframe twice, so that the
+byte-stream parser lets the first one go, and a short repeat of the sound for the parser and
+encoders), while the camera is woken in the background; its live video follows from its first
+keyframe, and a camera whose stream changed is forgotten and started over. The media is no
+longer suspended with Reset after DESCRIBE, which would have needed a new preroll on PLAY.
+---
+ src/rtsp/factory.rs     | 657 +++++++++++++++++++++++++++++++++-------
+ src/rtsp/gst/factory.rs |   5 +-
+ src/rtsp/mod.rs         |   1 +
+ src/rtsp/start_cache.rs | 348 +++++++++++++++++++++
+ src/ws/mod.rs           |   4 +
+ 5 files changed, 907 insertions(+), 108 deletions(-)
+ create mode 100644 src/rtsp/start_cache.rs
+
+diff --git a/src/rtsp/factory.rs b/src/rtsp/factory.rs
+index 1d61df6..8fbb839 100644
+--- a/src/rtsp/factory.rs
++++ b/src/rtsp/factory.rs
+@@ -14,7 +14,11 @@ use tokio::{sync::mpsc::channel as mpsc, task::JoinHandle};
+ 
+ use crate::{
+     common::NeoInstance,
+-    rtsp::{gst::NeoMediaFactory, recorder::Recorder},
++    rtsp::{
++        gst::NeoMediaFactory,
++        recorder::Recorder,
++        start_cache::{self, AudioFrame, StreamStart, VideoKind},
++    },
+     AnyResult,
+ };
+ 
+@@ -99,6 +103,19 @@ impl StreamConfig {
+         })
+     }
+ 
++    /// The stream as the last live view had it, to build a pipeline before the camera answers
++    fn from_start(start: &StreamStart) -> Self {
++        StreamConfig {
++            resolution: [0, 0],
++            bitrate: start.bitrate,
++            fps: start.fps.max(1),
++            fps_table: vec![],
++            bitrate_table: vec![],
++            vid_type: Some(start.video.into()),
++            aud_type: start.audio.as_ref().map(AudioFrame::audio_type),
++        }
++    }
++
+     fn update_fps(&mut self, fps: u32) {
+         let new_fps = self.fps_table.get(fps as usize).copied().unwrap_or(fps);
+         self.fps = new_fps;
+@@ -171,10 +188,14 @@ pub(super) async fn make_factory(
+                     let name = name.clone();
+                     tokio::task::spawn(async move {
+                         clear_bin(&element)?;
++                        let config = camera.config().await?.borrow().clone();
++                        if let Some(kept) = start_cache::load(&name, &stream.to_string()) {
++                            return quick_start(camera, name, stream, config, element, reply, kept)
++                                .await;
++                        }
+                         log::trace!("{name}::{stream}: Starting camera");
+ 
+                         // Start the camera
+-                        let config = camera.config().await?.borrow().clone();
+                         let mut media_rx = camera.stream_while_live(stream).await?;
+ 
+                         log::trace!("{name}::{stream}: Learning camera stream type");
+@@ -198,114 +219,27 @@ pub(super) async fn make_factory(
+                         }
+ 
+                         log::trace!("{name}::{stream}: Building the pipeline");
+-                        // Build the right video pipeline
+-                        let vid_src = match stream_config.vid_type.as_ref() {
+-                            Some(VideoType::H264) => {
+-                                let src = build_h264(&element, &stream_config)?;
+-                                AnyResult::Ok(Some(src))
+-                            }
+-                            Some(VideoType::H265) => {
+-                                let src = build_h265(&element, &stream_config)?;
+-                                AnyResult::Ok(Some(src))
+-                            }
+-                            None => {
+-                                build_unknown(&element, &config.splash_pattern.to_string())?;
+-                                AnyResult::Ok(None)
+-                            }
+-                        }?;
+-
+-                        // Build the right audio pipeline
+-                        let aud_src = match stream_config.aud_type.as_ref() {
+-                            Some(AudioType::Aac) => {
+-                                let src = build_aac(&element, &stream_config)?;
+-                                AnyResult::Ok(Some(src))
+-                            }
+-                            Some(AudioType::Adpcm(block_size)) => {
+-                                let src = build_adpcm(&element, *block_size, &stream_config)?;
+-                                AnyResult::Ok(Some(src))
+-                            }
+-                            None => AnyResult::Ok(None),
+-                        }?;
+-
+-                        if let Some(app) = vid_src.as_ref() {
+-                            app.set_callbacks(
+-                                AppSrcCallbacks::builder()
+-                                    .seek_data(move |_, _seek_pos| true)
+-                                    .build(),
+-                            );
+-                        }
+-                        if let Some(app) = aud_src.as_ref() {
+-                            app.set_callbacks(
+-                                AppSrcCallbacks::builder()
+-                                    .seek_data(move |_, _seek_pos| true)
+-                                    .build(),
+-                            );
+-                        }
++                        let (vid_src, aud_src) = build_sources(
++                            &element,
++                            &stream_config,
++                            &config.splash_pattern.to_string(),
++                        )?;
+ 
+                         log::trace!("{name}::{stream}: Sending pipeline to gstreamer");
+                         // Send the pipeline back to the factory so it can start
+                         let _ = reply.send(element);
+ 
+-                        // The live view is also written to a file when its camera records
+-                        let recorder = stream_config.vid_type.and_then(|video| {
+-                            Recorder::start(
+-                                &name,
+-                                video,
+-                                matches!(stream_config.aud_type, Some(AudioType::Aac)),
+-                            )
+-                        });
+-
+-                        // Run blocking code on a seperate thread
+-                        // This is not an async thread
++                        let view = LiveView::new(
++                            name,
++                            stream,
++                            vid_src,
++                            aud_src,
++                            stream_config,
++                            config.pause.on_motion,
++                            None,
++                        );
+                         let runtime = tokio::runtime::Handle::current();
+-                        // Paused on motion, a camera is silent on purpose
+-                        let idle_limit = (!config.pause.on_motion).then_some(MEDIA_IDLE_LIMIT);
+-                        std::thread::spawn(move || {
+-                            let mut aud_ts = 0u32;
+-                            let mut vid_ts = 0u32;
+-                            let mut pools = SendState::default();
+-
+-                            log::trace!("{name}::{stream}: Sending buffered frames");
+-                            for buffered in buffer.drain(..) {
+-                                send_to_sources(
+-                                    buffered,
+-                                    &mut pools,
+-                                    &vid_src,
+-                                    &aud_src,
+-                                    &mut vid_ts,
+-                                    &mut aud_ts,
+-                                    &stream_config,
+-                                    recorder.as_ref(),
+-                                )?;
+-                            }
+-
+-                            log::trace!("{name}::{stream}: Sending new frames");
+-                            while let Some(data) =
+-                                next_media(&runtime, &mut media_rx, idle_limit)
+-                            {
+-                                let r = send_to_sources(
+-                                    data,
+-                                    &mut pools,
+-                                    &vid_src,
+-                                    &aud_src,
+-                                    &mut vid_ts,
+-                                    &mut aud_ts,
+-                                    &stream_config,
+-                                    recorder.as_ref(),
+-                                );
+-                                if let Err(r) = &r {
+-                                    log::info!("Failed to send to source: {r:?}");
+-                                }
+-                                r?;
+-                            }
+-                            // Silent camera: end the client's stream too, the camera's session
+-                            // was let go with the receiver
+-                            for src in vid_src.iter().chain(aud_src.iter()) {
+-                                let _ = src.end_of_stream();
+-                            }
+-                            log::info!("{name}::{stream}: live view ended");
+-                            AnyResult::Ok(())
+-                        });
++                        std::thread::spawn(move || view.run(&runtime, media_rx, buffer));
+                         AnyResult::Ok(())
+                     });
+                 }
+@@ -326,6 +260,438 @@ pub(super) async fn make_factory(
+     Ok((factory, thread))
+ }
+ 
++/// A client of a camera whose stream start is known: its pipeline is built and prerolled from
++/// that start at once, so the RTSP answers come before a client gives up, and the camera is
++/// woken in the background. Its live frames follow from its first keyframe on.
++async fn quick_start(
++    camera: NeoInstance,
++    name: String,
++    stream: StreamKind,
++    config: crate::config::CameraConfig,
++    element: Element,
++    reply: tokio::sync::oneshot::Sender<Element>,
++    kept: StreamStart,
++) -> AnyResult<()> {
++    let stream_config = StreamConfig::from_start(&kept);
++    let (vid_src, aud_src) =
++        build_sources(&element, &stream_config, &config.splash_pattern.to_string())?;
++    let _ = reply.send(element);
++    log::info!("{name}::{stream}: answered from the last stream start, waking the camera");
++
++    let mut view = LiveView::new(
++        name,
++        stream,
++        vid_src,
++        aud_src,
++        stream_config,
++        config.pause.on_motion,
++        Some(kept),
++    );
++    let runtime = tokio::runtime::Handle::current();
++    std::thread::spawn(move || {
++        // Preroll first: the RTSP answer waits for it, the camera does not have to
++        view.preroll_kept()?;
++        let media_rx = runtime.block_on(camera.stream_while_live(stream))?;
++        view.run(&runtime, media_rx, vec![])
++    });
++    Ok(())
++}
++
++/// Build the video and audio branches of a client's pipeline for this stream
++fn build_sources(
++    element: &Element,
++    stream_config: &StreamConfig,
++    splash_pattern: &str,
++) -> AnyResult<(Option<AppSrc>, Option<AppSrc>)> {
++    let vid_src = match stream_config.vid_type.as_ref() {
++        Some(VideoType::H264) => Some(build_h264(element, stream_config)?),
++        Some(VideoType::H265) => Some(build_h265(element, stream_config)?),
++        None => {
++            build_unknown(element, splash_pattern)?;
++            None
++        }
++    };
++    let aud_src = match stream_config.aud_type.as_ref() {
++        Some(AudioType::Aac) => Some(build_aac(element, stream_config)?),
++        Some(AudioType::Adpcm(block_size)) => {
++            Some(build_adpcm(element, *block_size, stream_config)?)
++        }
++        None => None,
++    };
++    for app in vid_src.iter().chain(aud_src.iter()) {
++        app.set_callbacks(
++            AppSrcCallbacks::builder()
++                .seek_data(move |_, _seek_pos| true)
++                .build(),
++        );
++    }
++    Ok((vid_src, aud_src))
++}
++
++/// How long a client started from a kept stream start waits for the camera's first frame: the
++/// time a sleeping 4G camera may need to wake, connect over the relay and start its stream
++const FIRST_MEDIA_LIMIT: Duration = Duration::from_secs(60);
++
++/// How long the kept start may wait for the pipeline to take it (the RTSP server sets the
++/// pipeline to PAUSED right after the factory has answered)
++const PREROLL_LIMIT: Duration = Duration::from_secs(5);
++
++/// Copies of the kept keyframe and sound pushed for the preroll
++const PREROLL_KEYFRAMES: usize = 2;
++const PREROLL_AUDIO_FRAMES: usize = 4;
++
++fn us(micros: u32) -> Duration {
++    Duration::from_micros(micros as u64)
++}
++
++/// One client's live view: sends the camera's frames into its pipeline, on a thread of its own
++struct LiveView {
++    name: String,
++    stream: StreamKind,
++    vid_src: Option<AppSrc>,
++    aud_src: Option<AppSrc>,
++    stream_config: StreamConfig,
++    recorder: Option<Recorder>,
++    idle_limit: Option<Duration>,
++    kept: Option<StreamStart>,
++    /// The timestamps after the kept start that was pushed for the preroll
++    start_ts: (u32, u32),
++    learner: StartLearner,
++}
++
++impl LiveView {
++    fn new(
++        name: String,
++        stream: StreamKind,
++        vid_src: Option<AppSrc>,
++        aud_src: Option<AppSrc>,
++        stream_config: StreamConfig,
++        paused_on_motion: bool,
++        kept: Option<StreamStart>,
++    ) -> Self {
++        // The live view is also written to a file when its camera records
++        let recorder = stream_config.vid_type.and_then(|video| {
++            Recorder::start(
++                &name,
++                video,
++                matches!(stream_config.aud_type, Some(AudioType::Aac)),
++            )
++        });
++        Self {
++            learner: StartLearner::new(&name, stream),
++            name,
++            stream,
++            vid_src,
++            aud_src,
++            stream_config,
++            recorder,
++            // Paused on motion, a camera is silent on purpose
++            idle_limit: (!paused_on_motion).then_some(MEDIA_IDLE_LIMIT),
++            kept,
++            start_ts: (0, 0),
++        }
++    }
++
++    fn run(
++        mut self,
++        runtime: &tokio::runtime::Handle,
++        mut media_rx: tokio::sync::mpsc::Receiver<BcMedia>,
++        buffer: Vec<BcMedia>,
++    ) -> AnyResult<()> {
++        let name = self.name.clone();
++        let stream = self.stream;
++        let (mut vid_ts, mut aud_ts) = self.start_ts;
++        let mut pools = SendState::default();
++        // A client started from a kept start shows no live video before a live keyframe
++        let mut need_keyframe = false;
++
++        if let Some(kept) = self.kept.take() {
++            need_keyframe = true;
++            // Wait for the waking camera, as long as the client is still there
++            let Some(first) = self.first_media(runtime, &mut media_rx) else {
++                self.end();
++                return Ok(());
++            };
++            if !self.fits(&first, &kept) {
++                log::info!("{name}::{stream}: the camera's stream changed, starting over");
++                start_cache::forget(&name, &stream.to_string());
++                self.end();
++                return Ok(());
++            }
++            self.send(
++                first,
++                &mut pools,
++                &mut vid_ts,
++                &mut aud_ts,
++                &mut need_keyframe,
++            )?;
++        }
++
++        log::trace!("{name}::{stream}: Sending buffered frames");
++        for buffered in buffer {
++            self.send(
++                buffered,
++                &mut pools,
++                &mut vid_ts,
++                &mut aud_ts,
++                &mut need_keyframe,
++            )?;
++        }
++
++        log::trace!("{name}::{stream}: Sending new frames");
++        while let Some(data) = next_media(runtime, &mut media_rx, self.idle_limit) {
++            let r = self.send(
++                data,
++                &mut pools,
++                &mut vid_ts,
++                &mut aud_ts,
++                &mut need_keyframe,
++            );
++            if let Err(r) = &r {
++                log::info!("Failed to send to source: {r:?}");
++            }
++            r?;
++        }
++        // Silent camera: end the client's stream too, the camera's session was let go with the
++        // receiver
++        self.end();
++        log::info!("{name}::{stream}: live view ended");
++        AnyResult::Ok(())
++    }
++
++    /// One frame of the camera into the pipeline (and the recorder)
++    fn send(
++        &mut self,
++        data: BcMedia,
++        pools: &mut SendState,
++        vid_ts: &mut u32,
++        aud_ts: &mut u32,
++        need_keyframe: &mut bool,
++    ) -> AnyResult<()> {
++        self.learner.see(&data, &self.stream_config);
++        if let BcMedia::InfoV1(_) | BcMedia::InfoV2(_) = &data {
++            self.stream_config.update_from_media(&data);
++        }
++        match &data {
++            BcMedia::Pframe(_) if *need_keyframe => return Ok(()),
++            BcMedia::Iframe(_) => *need_keyframe = false,
++            BcMedia::Aac(_) | BcMedia::Adpcm(_) => {
++                // Sound of another kind than the pipeline was built for cannot go in
++                let fits = match (&self.stream_config.aud_type, AudioFrame::from_media(&data)) {
++                    (Some(built), Some(frame)) => {
++                        start_cache::same_audio(built, &frame.audio_type())
++                    }
++                    _ => true,
++                };
++                if !fits {
++                    return Ok(());
++                }
++            }
++            _ => {}
++        }
++        send_to_sources(
++            data,
++            pools,
++            &self.vid_src,
++            &self.aud_src,
++            vid_ts,
++            aud_ts,
++            &self.stream_config,
++            self.recorder.as_ref(),
++        )
++    }
++
++    /// Push the kept keyframe and sound, so that the pipeline prerolls without the camera
++    fn preroll_kept(&mut self) -> AnyResult<()> {
++        let Some(kept) = self.kept.clone() else {
++            return Ok(());
++        };
++        log::trace!(
++            "{}::{}: Prerolling with the kept stream start",
++            self.name,
++            self.stream
++        );
++        let (mut vid_ts, mut aud_ts) = (0, 0);
++        self.preroll(&kept, &mut vid_ts, &mut aud_ts)?;
++        self.start_ts = (vid_ts, aud_ts);
++        Ok(())
++    }
++
++    fn preroll(&self, kept: &StreamStart, vid_ts: &mut u32, aud_ts: &mut u32) -> AnyResult<()> {
++        if let Some(vid_src) = self.vid_src.as_ref() {
++            // A byte-stream parser lets a frame go only when the next one begins: the keyframe
++            // twice, so that the first one reaches the payloader
++            let frame = 1_000_000 / self.stream_config.fps.max(1);
++            for _ in 0..PREROLL_KEYFRAMES {
++                push_when_taken(vid_src, kept.keyframe.clone(), us(*vid_ts))?;
++                *vid_ts += frame;
++            }
++        }
++        if let (Some(aud_src), Some(audio)) = (self.aud_src.as_ref(), kept.audio.as_ref()) {
++            let media = audio.to_media();
++            let duration = match &media {
++                BcMedia::Aac(aac) => aac.duration(),
++                BcMedia::Adpcm(adpcm) => adpcm.duration(),
++                _ => None,
++            }
++            .unwrap_or(64_000);
++            let data = match media {
++                BcMedia::Aac(aac) => aac.data,
++                BcMedia::Adpcm(adpcm) => adpcm.data,
++                _ => unreachable!("audio frame"),
++            };
++            // The parser checks the next frame's header, the encoders need whole frames of
++            // their own: a short repeat of the kept sound
++            for _ in 0..PREROLL_AUDIO_FRAMES {
++                push_when_taken(aud_src, data.clone(), us(*aud_ts))?;
++                *aud_ts += duration;
++            }
++        }
++        Ok(())
++    }
++
++    /// The camera's first frame, waiting up to FIRST_MEDIA_LIMIT while the client is there
++    fn first_media(
++        &self,
++        runtime: &tokio::runtime::Handle,
++        media_rx: &mut tokio::sync::mpsc::Receiver<BcMedia>,
++    ) -> Option<BcMedia> {
++        let started = Instant::now();
++        while started.elapsed() < FIRST_MEDIA_LIMIT {
++            let step = runtime.block_on(async {
++                tokio::time::timeout(Duration::from_secs(1), media_rx.recv()).await
++            });
++            match step {
++                Ok(media) => return media,
++                Err(_) => {
++                    let gone = self
++                        .vid_src
++                        .iter()
++                        .chain(self.aud_src.iter())
++                        .any(|src| check_live(src).is_err());
++                    if gone {
++                        log::info!(
++                            "{}::{}: the client left before the camera woke",
++                            self.name,
++                            self.stream
++                        );
++                        return None;
++                    }
++                }
++            }
++        }
++        log::info!(
++            "{}::{}: the camera sent nothing for {FIRST_MEDIA_LIMIT:?}, ending the live view",
++            self.name,
++            self.stream
++        );
++        None
++    }
++
++    /// Whether the camera's live frame fits the pipeline built from the kept start
++    fn fits(&self, media: &BcMedia, kept: &StreamStart) -> bool {
++        match media {
++            BcMedia::Iframe(BcMediaIframe { video_type, .. })
++            | BcMedia::Pframe(BcMediaPframe { video_type, .. }) => {
++                VideoKind::from(*video_type) == kept.video
++            }
++            _ => true,
++        }
++    }
++
++    fn end(&self) {
++        for src in self.vid_src.iter().chain(self.aud_src.iter()) {
++            let _ = src.end_of_stream();
++        }
++    }
++}
++
++/// Learns the start of a live view (its first keyframe and sound) to keep it for the next client
++struct StartLearner {
++    camera: String,
++    stream: String,
++    keyframe: Option<(VideoKind, Vec<u8>)>,
++    audio: Option<AudioFrame>,
++    frames_after_keyframe: usize,
++    done: bool,
++}
++
++/// Frames after the keyframe within which the sound is waited for before keeping a start without
++const AUDIO_WAIT_FRAMES: usize = 30;
++
++impl StartLearner {
++    fn new(camera: &str, stream: StreamKind) -> Self {
++        Self {
++            camera: camera.to_string(),
++            stream: stream.to_string(),
++            keyframe: None,
++            audio: None,
++            frames_after_keyframe: 0,
++            done: false,
++        }
++    }
++
++    fn see(&mut self, media: &BcMedia, stream_config: &StreamConfig) {
++        if self.done {
++            return;
++        }
++        match media {
++            BcMedia::Iframe(BcMediaIframe {
++                video_type, data, ..
++            }) if self.keyframe.is_none() => {
++                self.keyframe = Some(((*video_type).into(), data.clone()));
++            }
++            BcMedia::Aac(_) | BcMedia::Adpcm(_) if self.audio.is_none() => {
++                self.audio = AudioFrame::from_media(media);
++            }
++            _ => {}
++        }
++        if self.keyframe.is_some() {
++            self.frames_after_keyframe += 1;
++        }
++        let Some((video, keyframe)) = self.keyframe.as_ref() else {
++            return;
++        };
++        if self.audio.is_none() && self.frames_after_keyframe < AUDIO_WAIT_FRAMES {
++            return;
++        }
++        start_cache::save(
++            &self.camera,
++            &self.stream,
++            StreamStart {
++                video: *video,
++                fps: stream_config.fps,
++                bitrate: stream_config.bitrate,
++                keyframe: keyframe.clone(),
++                audio: self.audio.clone(),
++            },
++        );
++        self.done = true;
++    }
++}
++
++/// Push a buffer once the pipeline takes it (it is not PAUSED yet right after the factory answered)
++fn push_when_taken(appsrc: &AppSrc, data: Vec<u8>, ts: Duration) -> AnyResult<()> {
++    let started = Instant::now();
++    let time = ClockTime::from_useconds(ts.as_micros() as u64);
++    loop {
++        let mut buf = gstreamer::Buffer::from_mut_slice(data.clone());
++        {
++            let buf_mut = buf.get_mut().expect("A new buffer is writable");
++            buf_mut.set_dts(time);
++            buf_mut.set_pts(time);
++        }
++        match appsrc.push_buffer(buf) {
++            Ok(_) => return Ok(()),
++            Err(FlowError::Flushing) if started.elapsed() < PREROLL_LIMIT => {
++                check_live(appsrc)?;
++                std::thread::sleep(Duration::from_millis(10));
++            }
++            Err(e) => return Err(anyhow!("Could not preroll {}: {e:?}", appsrc.name())),
++        }
++    }
++}
++
+ /// How long a live view waits for the camera's next frame. A camera that stops sending (a
+ /// stalled relay, a camera falling asleep) left the stream waiting forever, and the waiting
+ /// stream kept the camera's session open: a battery camera stayed awake for hours.
+@@ -1097,9 +1463,11 @@ mod tests {
+         let runtime = tokio::runtime::Runtime::new().unwrap();
+         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+         runtime
+-            .block_on(tx.send(BcMedia::Aac(neolink_core::bcmedia::model::BcMediaAac {
+-                data: vec![0xff],
+-            })))
++            .block_on(
++                tx.send(BcMedia::Aac(neolink_core::bcmedia::model::BcMediaAac {
++                    data: vec![0xff],
++                })),
++            )
+             .unwrap();
+         let limit = Duration::from_millis(200);
+         assert!(next_media(runtime.handle(), &mut rx, Some(limit)).is_some());
+@@ -1110,6 +1478,81 @@ mod tests {
+         drop(tx);
+     }
+ 
++    /// The first encoded buffer of a test pipeline that ends in an appsink named `out`
++    fn first_buffer(launch: &str) -> Vec<u8> {
++        let pipeline = gstreamer::parse::launch(launch)
++            .unwrap()
++            .dynamic_cast::<Pipeline>()
++            .unwrap();
++        let sink = pipeline
++            .by_name("out")
++            .unwrap()
++            .dynamic_cast::<AppSink>()
++            .unwrap();
++        pipeline.set_state(gstreamer::State::Playing).unwrap();
++        let sample = sink
++            .try_pull_sample(ClockTime::from_seconds(10))
++            .expect("the test encoder made nothing");
++        let data = sample.buffer().unwrap().map_readable().unwrap().to_vec();
++        pipeline.set_state(gstreamer::State::Null).unwrap();
++        data
++    }
++
++    /// A start like the G330's: an H.264 keyframe with SPS/PPS and one ADTS AAC frame of 16 kHz
++    fn camera_like_start() -> StreamStart {
++        let keyframe = first_buffer(
++            "videotestsrc num-buffers=1 ! video/x-raw,width=640,height=360 \
++             ! x264enc key-int-max=1 \
++             ! video/x-h264,stream-format=byte-stream,alignment=au ! appsink name=out",
++        );
++        let aac = first_buffer(
++            "audiotestsrc num-buffers=8 ! audio/x-raw,rate=16000,channels=1 ! avenc_aac \
++             ! aacparse ! audio/mpeg,stream-format=adts ! appsink name=out",
++        );
++        assert_eq!(&aac[..2], &[0xff, 0xf1], "not ADTS");
++        StreamStart {
++            video: VideoKind::H264,
++            fps: 15,
++            bitrate: 393216,
++            keyframe,
++            audio: Some(AudioFrame::Aac(aac)),
++        }
++    }
++
++    #[test]
++    fn a_kept_start_prerolls_the_pipeline_without_the_camera() {
++        gstreamer::init().unwrap();
++        let start = camera_like_start();
++        let pipeline = Pipeline::new();
++        let (vid_src, aud_src) = build_sources(
++            pipeline.upcast_ref::<Element>(),
++            &StreamConfig::from_start(&start),
++            "black",
++        )
++        .unwrap();
++        for payloader in ["pay0", "pay1", "pay2"] {
++            catch(&pipeline, payloader);
++        }
++        let mut view = LiveView::new(
++            "preroll-test".into(),
++            StreamKind::Sub,
++            vid_src,
++            aud_src,
++            StreamConfig::from_start(&start),
++            false,
++            Some(start),
++        );
++        // As the RTSP server does for DESCRIBE: PAUSED, waiting for the preroll
++        let _ = pipeline.set_state(gstreamer::State::Paused);
++        let started = Instant::now();
++        view.preroll_kept().unwrap();
++        let (result, state, _) = pipeline.state(ClockTime::from_seconds(3));
++        pipeline.set_state(gstreamer::State::Null).unwrap();
++        assert!(result.is_ok(), "no preroll: {result:?}");
++        assert_eq!(state, gstreamer::State::Paused);
++        assert!(started.elapsed() < Duration::from_secs(2));
++    }
++
+     #[test]
+     fn decoded_audio_is_paid_as_aac_and_opus() {
+         gstreamer::init().unwrap();
+diff --git a/src/rtsp/gst/factory.rs b/src/rtsp/gst/factory.rs
+index c7a88c4..3e08a41 100644
+--- a/src/rtsp/gst/factory.rs
++++ b/src/rtsp/gst/factory.rs
+@@ -39,7 +39,10 @@ impl NeoMediaFactory {
+         factory.set_eos_shutdown(false);
+         factory.set_stop_on_disconnect(false);
+         // factory.set_publish_clock_mode(gstreamer_rtsp_server::RTSPPublishClockMode::Clock);
+-        factory.set_suspend_mode(gstreamer_rtsp_server::RTSPSuspendMode::Reset);
++        // Not Reset: a reset media must preroll again on PLAY, and a client such as go2rtc waits
++        // only 5 s for the answer to PLAY, while a sleeping camera needs longer for its first frame.
++        // The media prerolled for DESCRIBE (see rtsp::start_cache) is played as it is.
++        factory.set_suspend_mode(gstreamer_rtsp_server::RTSPSuspendMode::None);
+         factory.set_launch("videotestsrc pattern=\"snow\" ! video/x-raw,width=896,height=512,framerate=25/1 ! textoverlay name=\"inittextoverlay\" text=\"Stream not Ready\" valignment=top halignment=left font-desc=\"Sans, 32\" ! jpegenc ! rtpjpegpay name=pay0");
+         factory.set_transport_mode(RTSPTransportMode::PLAY);
+         factory
+diff --git a/src/rtsp/mod.rs b/src/rtsp/mod.rs
+index 979a3ca..7140e70 100644
+--- a/src/rtsp/mod.rs
++++ b/src/rtsp/mod.rs
+@@ -71,6 +71,7 @@ mod cmdline;
+ mod factory;
+ mod gst;
+ pub(crate) mod recorder;
++pub(crate) mod start_cache;
+ mod stream;
+ 
+ use crate::common::{NeoInstance, NeoReactor};
+diff --git a/src/rtsp/start_cache.rs b/src/rtsp/start_cache.rs
+new file mode 100644
+index 0000000..ebe235b
+--- /dev/null
++++ b/src/rtsp/start_cache.rs
+@@ -0,0 +1,348 @@
++//! What a camera's stream looked like the last time: kept to answer a new RTSP client at once
++//!
++//! A battery or 4G camera that sleeps needs 10-20 s to connect and send its first frame, while
++//! RTSP clients give up much sooner: go2rtc (Home Assistant's WebRTC) waits only 5 s for the
++//! answer to DESCRIBE, SETUP and PLAY, whatever `#timeout=` says. The answer to DESCRIBE needs a
++//! prerolled pipeline, and building one needed the camera's codecs and a keyframe.
++//!
++//! So each live view remembers its codecs, frame rate, the first keyframe (with SPS/PPS) and the
++//! first audio frame. The next client gets a pipeline prerolled with those at once, while the
++//! camera connects in the background and its live frames follow when they come. The start is
++//! kept in memory and, when `init` was given a folder, in `<dir>/<camera>-<stream>.start` so it
++//! survives a restart.
++use anyhow::{anyhow, Context, Result};
++use neolink_core::bcmedia::model::{BcMedia, BcMediaAac, BcMediaAdpcm, VideoType};
++use serde::{Deserialize, Serialize};
++use std::{
++    collections::HashMap,
++    path::{Path, PathBuf},
++    sync::{Mutex, OnceLock},
++};
++
++use super::factory::AudioType;
++
++static DIR: OnceLock<PathBuf> = OnceLock::new();
++static MEMORY: Mutex<Option<HashMap<String, StreamStart>>> = Mutex::new(None);
++
++const MAGIC: &[u8; 8] = b"NLSTART1";
++
++/// Keep the starts on disk in `dir` too (created when missing)
++pub(crate) fn init(dir: &Path) {
++    if let Err(e) = std::fs::create_dir_all(dir) {
++        log::warn!(
++            "Stream starts are not kept on disk ({}): {e}",
++            dir.display()
++        );
++        return;
++    }
++    let _ = DIR.set(dir.to_path_buf());
++}
++
++/// The start of one camera stream
++#[derive(Clone, Debug, PartialEq)]
++pub(crate) struct StreamStart {
++    pub(crate) video: VideoKind,
++    pub(crate) fps: u32,
++    pub(crate) bitrate: u32,
++    /// The first keyframe of the last live view, with its parameter sets
++    pub(crate) keyframe: Vec<u8>,
++    /// The first audio frame of the last live view
++    pub(crate) audio: Option<AudioFrame>,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
++pub(crate) enum VideoKind {
++    H264,
++    H265,
++}
++
++impl From<VideoType> for VideoKind {
++    fn from(video: VideoType) -> Self {
++        match video {
++            VideoType::H264 => VideoKind::H264,
++            VideoType::H265 => VideoKind::H265,
++        }
++    }
++}
++
++impl From<VideoKind> for VideoType {
++    fn from(video: VideoKind) -> Self {
++        match video {
++            VideoKind::H264 => VideoType::H264,
++            VideoKind::H265 => VideoType::H265,
++        }
++    }
++}
++
++#[derive(Clone, Debug, PartialEq)]
++pub(crate) enum AudioFrame {
++    Aac(Vec<u8>),
++    Adpcm(Vec<u8>),
++}
++
++impl AudioFrame {
++    pub(crate) fn from_media(media: &BcMedia) -> Option<Self> {
++        match media {
++            BcMedia::Aac(aac) => Some(AudioFrame::Aac(aac.data.clone())),
++            BcMedia::Adpcm(adpcm) => Some(AudioFrame::Adpcm(adpcm.data.clone())),
++            _ => None,
++        }
++    }
++
++    pub(crate) fn audio_type(&self) -> AudioType {
++        match self {
++            AudioFrame::Aac(_) => AudioType::Aac,
++            AudioFrame::Adpcm(data) => AudioType::Adpcm(data.len().saturating_sub(4) as u32),
++        }
++    }
++
++    pub(crate) fn to_media(&self) -> BcMedia {
++        match self {
++            AudioFrame::Aac(data) => BcMedia::Aac(BcMediaAac { data: data.clone() }),
++            AudioFrame::Adpcm(data) => BcMedia::Adpcm(BcMediaAdpcm { data: data.clone() }),
++        }
++    }
++
++    fn data(&self) -> &[u8] {
++        match self {
++            AudioFrame::Aac(data) | AudioFrame::Adpcm(data) => data,
++        }
++    }
++}
++
++/// The audio type a live frame has, to tell whether it fits the pipeline
++pub(crate) fn same_audio(a: &AudioType, b: &AudioType) -> bool {
++    match (a, b) {
++        (AudioType::Aac, AudioType::Aac) => true,
++        (AudioType::Adpcm(x), AudioType::Adpcm(y)) => x == y,
++        _ => false,
++    }
++}
++
++/// The part of the file before the frames
++#[derive(Serialize, Deserialize)]
++struct Header {
++    video: VideoKind,
++    fps: u32,
++    bitrate: u32,
++    keyframe_len: u32,
++    /// "aac" or "adpcm"
++    audio: Option<String>,
++    audio_len: u32,
++}
++
++fn key(camera: &str, stream: &str) -> String {
++    let safe: String = format!("{camera}-{stream}")
++        .chars()
++        .map(|c| {
++            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
++                c
++            } else {
++                '_'
++            }
++        })
++        .collect();
++    safe
++}
++
++fn path(dir: &Path, camera: &str, stream: &str) -> PathBuf {
++    dir.join(format!("{}.start", key(camera, stream)))
++}
++
++/// The last start of this camera stream: from memory, else from disk
++pub(crate) fn load(camera: &str, stream: &str) -> Option<StreamStart> {
++    let key = key(camera, stream);
++    if let Some(start) = MEMORY
++        .lock()
++        .unwrap()
++        .as_ref()
++        .and_then(|memory| memory.get(&key).cloned())
++    {
++        return Some(start);
++    }
++    let dir = DIR.get()?;
++    match read(&path(dir, camera, stream)) {
++        Ok(start) => {
++            MEMORY
++                .lock()
++                .unwrap()
++                .get_or_insert_with(HashMap::new)
++                .insert(key, start.clone());
++            Some(start)
++        }
++        Err(e) => {
++            log::debug!("{camera}::{stream}: no stream start kept: {e:#}");
++            None
++        }
++    }
++}
++
++/// Remember this start (also on disk when set up)
++pub(crate) fn save(camera: &str, stream: &str, start: StreamStart) {
++    let unchanged = MEMORY
++        .lock()
++        .unwrap()
++        .get_or_insert_with(HashMap::new)
++        .insert(key(camera, stream), start.clone())
++        .is_some_and(|old| old == start);
++    if unchanged {
++        return;
++    }
++    if let Some(dir) = DIR.get() {
++        if let Err(e) = write(&path(dir, camera, stream), &start) {
++            log::warn!("{camera}::{stream}: could not keep the stream start: {e:#}");
++        }
++    }
++}
++
++/// Forget a start that no longer fits the camera
++pub(crate) fn forget(camera: &str, stream: &str) {
++    if let Some(memory) = MEMORY.lock().unwrap().as_mut() {
++        memory.remove(&key(camera, stream));
++    }
++    if let Some(dir) = DIR.get() {
++        let _ = std::fs::remove_file(path(dir, camera, stream));
++    }
++}
++
++fn write(file: &Path, start: &StreamStart) -> Result<()> {
++    let header = Header {
++        video: start.video,
++        fps: start.fps,
++        bitrate: start.bitrate,
++        keyframe_len: start.keyframe.len() as u32,
++        audio: start.audio.as_ref().map(|audio| {
++            match audio {
++                AudioFrame::Aac(_) => "aac",
++                AudioFrame::Adpcm(_) => "adpcm",
++            }
++            .to_string()
++        }),
++        audio_len: start
++            .audio
++            .as_ref()
++            .map(|a| a.data().len() as u32)
++            .unwrap_or(0),
++    };
++    let header = serde_json::to_vec(&header)?;
++    let mut bytes = Vec::with_capacity(MAGIC.len() + 4 + header.len() + start.keyframe.len());
++    bytes.extend_from_slice(MAGIC);
++    bytes.extend_from_slice(&(header.len() as u32).to_le_bytes());
++    bytes.extend_from_slice(&header);
++    bytes.extend_from_slice(&start.keyframe);
++    if let Some(audio) = start.audio.as_ref() {
++        bytes.extend_from_slice(audio.data());
++    }
++    // Whole file or nothing: a start cut short would preroll a broken keyframe
++    let partial = file.with_extension("start.part");
++    std::fs::write(&partial, &bytes).with_context(|| format!("writing {}", partial.display()))?;
++    std::fs::rename(&partial, file)?;
++    Ok(())
++}
++
++fn read(file: &Path) -> Result<StreamStart> {
++    let bytes = std::fs::read(file)?;
++    let rest = bytes
++        .strip_prefix(MAGIC.as_slice())
++        .ok_or_else(|| anyhow!("not a stream start file"))?;
++    let (len, rest) = rest
++        .split_at_checked(4)
++        .ok_or_else(|| anyhow!("cut short"))?;
++    let len = u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize;
++    let (header, rest) = rest
++        .split_at_checked(len)
++        .ok_or_else(|| anyhow!("cut short"))?;
++    let header: Header = serde_json::from_slice(header)?;
++    let (keyframe, rest) = rest
++        .split_at_checked(header.keyframe_len as usize)
++        .ok_or_else(|| anyhow!("cut short"))?;
++    let (audio, rest) = rest
++        .split_at_checked(header.audio_len as usize)
++        .ok_or_else(|| anyhow!("cut short"))?;
++    if !rest.is_empty() || keyframe.is_empty() {
++        return Err(anyhow!("unexpected length"));
++    }
++    let audio = match header.audio.as_deref() {
++        Some("aac") => Some(AudioFrame::Aac(audio.to_vec())),
++        Some("adpcm") => Some(AudioFrame::Adpcm(audio.to_vec())),
++        Some(other) => return Err(anyhow!("unknown audio {other}")),
++        None => None,
++    };
++    Ok(StreamStart {
++        video: header.video,
++        fps: header.fps,
++        bitrate: header.bitrate,
++        keyframe: keyframe.to_vec(),
++        audio,
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn sample() -> StreamStart {
++        StreamStart {
++            video: VideoKind::H264,
++            fps: 15,
++            bitrate: 262144,
++            keyframe: vec![0, 0, 0, 1, 0x67, 1, 2, 3],
++            audio: Some(AudioFrame::Aac(vec![0xff, 0xf1, 9, 9])),
++        }
++    }
++
++    fn temp_dir(name: &str) -> PathBuf {
++        let dir = std::env::temp_dir().join(format!("neolink-start-{}-{name}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).unwrap();
++        dir
++    }
++
++    #[test]
++    fn a_stream_start_survives_the_disk() {
++        let dir = temp_dir("disk");
++        let file = path(&dir, "G330", "subStream");
++        write(&file, &sample()).unwrap();
++        assert_eq!(read(&file).unwrap(), sample());
++
++        let silent = StreamStart {
++            audio: None,
++            ..sample()
++        };
++        write(&file, &silent).unwrap();
++        assert_eq!(read(&file).unwrap(), silent);
++    }
++
++    #[test]
++    fn a_damaged_start_file_is_not_used() {
++        let dir = temp_dir("damaged");
++        let file = path(&dir, "G330", "subStream");
++        write(&file, &sample()).unwrap();
++        let bytes = std::fs::read(&file).unwrap();
++        std::fs::write(&file, &bytes[..bytes.len() - 2]).unwrap();
++        assert!(read(&file).is_err());
++        std::fs::write(&file, b"something else").unwrap();
++        assert!(read(&file).is_err());
++    }
++
++    #[test]
++    fn a_camera_name_stays_one_file_name() {
++        assert_eq!(key("../a b/c", "mainStream"), "___a_b_c-mainStream");
++    }
++
++    #[test]
++    fn the_last_start_is_remembered_and_can_be_forgotten() {
++        save("memory-test", "subStream", sample());
++        assert_eq!(load("memory-test", "subStream"), Some(sample()));
++        forget("memory-test", "subStream");
++        assert_eq!(load("memory-test", "subStream"), None);
++    }
++
++    #[test]
++    fn audio_frames_keep_their_kind() {
++        let adpcm = AudioFrame::Adpcm(vec![0; 4 + 512]);
++        assert!(same_audio(&adpcm.audio_type(), &AudioType::Adpcm(512)));
++        assert!(!same_audio(&adpcm.audio_type(), &AudioType::Aac));
++        assert_eq!(AudioFrame::from_media(&adpcm.to_media()), Some(adpcm));
++    }
++}
+diff --git a/src/ws/mod.rs b/src/ws/mod.rs
+index 224bbf8..4555dd6 100644
+--- a/src/ws/mod.rs
++++ b/src/ws/mod.rs
+@@ -248,6 +248,10 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
+     let cancel = CancellationToken::new();
+     let _cancel_drop = cancel.clone().drop_guard();
+     let mut set = JoinSet::<AnyResult<()>>::new();
++    if let Some(dir) = ws_config.snapshot_dir.as_deref().filter(|d| !d.is_empty()) {
++        // The start of each camera stream, so that a new RTSP client is answered at once
++        crate::rtsp::start_cache::init(&std::path::Path::new(dir).join("stream"));
++    }
+     if let Some(dir) = ws_config.record_dir.as_deref().filter(|d| !d.is_empty()) {
+         let switches = ws_config
+             .record_switches
+-- 
+2.54.0 (Apple Git-157)
+
